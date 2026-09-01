@@ -24,17 +24,16 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "dask[array]>=2024.1.0",
     "matplotlib>=3.7.0",
-    "napari>=0.5.0",
+    "napari>=0.9.0,<0.10",
     "numpy>=1.24.0",
     "opencv-python>=4.7.0",
     "openpyxl>=3.1.0",
@@ -48,9 +47,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Allow easy installation with the full, default napari installation
-# (including Qt backend) using napari-sigma[all].
-all = ["napari[all]"]
+# Provide a reproducible end-user installation with napari's Qt6 backend.
+all = ["napari[pyqt6,optional]>=0.9.0,<0.10"]
 
 [project.urls]
 Homepage = "https://github.com/fenghuibao/napari-sigma"

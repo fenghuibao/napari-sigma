@@ -11414,10 +11414,10 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         g.addWidget(self.psf_ratio_spin, 1, 1)
 
         self.frangi_response_mode_combo = QComboBox()
-        self.frangi_response_mode_combo.addItem("vesselness", "vesselness")
-        self.frangi_response_mode_combo.addItem("sheetness", "sheetness")
+        self.frangi_response_mode_combo.addItem("vesselness (tubular)", "vesselness")
+        self.frangi_response_mode_combo.addItem("sheetness (sheet-like)", "sheetness")
         self.frangi_response_mode_combo.addItem("combined", "combined")
-        self.frangi_response_mode_combo.setCurrentText("vesselness")
+        self.frangi_response_mode_combo.setCurrentIndex(0)
         self.frangi_response_mode_combo.currentIndexChanged.connect(self._on_frangi_response_mode_changed)
 
         self.kernel_spin = QSpinBox()

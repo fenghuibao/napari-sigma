@@ -28,7 +28,16 @@ pip install --upgrade "napari-sigma[all]"
 napari
 ```
 
-Then select **SIGMA** from napari's **Plugins** menu.
+The `all` extra installs a compatible napari 0.9 release with the PyQt6 backend and napari's optional runtime dependencies. Then select **SIGMA** from napari's **Plugins** menu.
+
+Do not install an older `napari-sigma[all]` and then upgrade only the `napari` package: pip does not automatically remove the Qt5 backend selected by an older napari release. If an existing environment contains PyQt5, clean it once before reinstalling SIGMA:
+
+```bash
+python -m pip uninstall -y PyQt5 PyQt5-Qt5 PyQt5-sip
+python -m pip install --upgrade "napari-sigma[all]"
+```
+
+A fresh environment remains the recommended installation path. Environment variables such as `QT_API`, `QT_PLUGIN_PATH`, or `QT_QPA_PLATFORM_PLUGIN_PATH` can override backend discovery and should not be globally fixed to a different Qt installation.
 
 ### Development installation
 
@@ -55,16 +64,20 @@ SIGMA preserves available physical-size and axis metadata. If physical size meta
 
 ## Quick start
 
-1. Open a microscopy image in napari.
-2. Open **SIGMA** from the **Plugins** menu.
-3. Use **Segmentation** to extract local structural evidence and infer a binary foreground mask.
-4. Use **Morphology Analysis** to measure connected structures and their skeleton topology.
-5. Use **Tracking** to associate objects across adjacent frames and classify linear, fission, fusion, or split-merge transitions.
-6. Use **Proximity Analysis** to quantify the spatial association between structures segmented in separate fluorescence channels.
+1. Start napari and open **Plugins > SIGMA**.
+2. In the **Segmentation** tab, select **Open File** and load a fluorescence image. TIFF is recommended when axis metadata or calibrated pixel and voxel sizes are needed.
+3. Confirm the interpreted channel, time, and slice ranges. Supported image organizations include `YX`, `ZYX`, `TYX`, and `TZYX`. Spatial 3D images open in napari's 3D display mode by default, while 2D time series remain in 2D.
+4. Review the physical scale under **Image Info** and correct it before any analysis that reports calibrated measurements.
+5. Select a computational device: **CPU** works on all supported systems, **CUDA** uses a compatible NVIDIA GPU, and **MPS** uses Apple Silicon GPU acceleration.
+6. Use **Segmentation** to extract local structural evidence and infer a binary foreground mask.
+7. Use **Morphology Analysis** to measure connected structures and their skeleton topology.
+8. For time series, use **Tracking** to associate objects across adjacent frames and classify linear, fission, fusion, or split-merge transitions.
+9. For aligned fluorescence channels, use **Proximity Analysis** to quantify spatial association between independently segmented structures.
+
+Each workflow operates on napari layers. Check the selected layer before running a command, especially when raw, processed, structural-response, and segmentation layers are open together. Results are returned as regular napari layers regardless of the selected computational device.
 
 ## Documentation
 
-- [Getting started](./docs/getting-started.md)
 - [Segmentation](./docs/segmentation.md)
 - [Morphology Analysis](./docs/morphology-analysis.md)
 - [Tracking](./docs/tracking.md)
