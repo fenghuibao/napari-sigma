@@ -1,5 +1,5 @@
 name: "\U0001F41B Bug Report"
-description: Report a bug encountered while using segment-any-confocal-images
+description: Report a bug encountered while using SIGMA
 labels:
   - "bug"
 

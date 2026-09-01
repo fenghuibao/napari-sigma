@@ -1,5 +1,6 @@
 import math
 import numbers
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -28,67 +29,125 @@ class GaussianSmoothing(nn.Module):
     """
 
     def __init__(self, channels, kernel_size, sigma, dim=2, order=0, device=None):
-        super(GaussianSmoothing, self).__init__()
-        self.padd = kernel_size // 2
+        super().__init__()
         self.dim = dim
-        self.std = sigma
+        self.order = order
         if isinstance(kernel_size, numbers.Number):
             kernel_size = [kernel_size] * dim
         if isinstance(sigma, numbers.Number):
             sigma = [sigma] * dim
-
-        # The gaussian kernel is the product of the
-        # gaussian function of each dimension.
-        kernel = 1
-        meshgrids = torch.meshgrid(
-            [
-                torch.arange(-self.padd, self.padd+1, dtype=torch.float32)
-                for size in kernel_size
-            ],
-            indexing = 'ij'
-        )
-        for size, std, mgrid in zip(kernel_size, sigma, meshgrids):
-            mean = size // 2
-            kernel *= 1 / (std * math.sqrt(2 * math.pi)) * \
-                      torch.exp(-(mgrid / std) ** 2 / 2)
-        
-        # Make sure sum of values in gaussian kernel equals 1.
-        kernel = kernel / torch.sum(kernel)
-
-        # Reshape to depthwise convolutional weight
-        kernel = kernel.view(1, 1, *kernel.size())
-
-        # Derivatives
-        if dim == 2:
-            if order == 'x':
-                kernel[0, 0] = - meshgrids[1] / self.std ** 2 * kernel[0, 0]
-            elif order == 'y':
-                kernel[0, 0] = - meshgrids[0] / self.std ** 2 * kernel[0, 0]
-        else:
-            if order == 'x':
-                kernel[0, 0] = - meshgrids[2] / self.std ** 2 * kernel[0, 0]
-            if order == 'y':
-                kernel[0, 0] = - meshgrids[1] / self.std ** 2 * kernel[0, 0]
-            if order == 'z':
-                kernel[0, 0] = - meshgrids[0] / self.std ** 2 * kernel[0, 0]
-
-        kernel = kernel.repeat(channels, *[1] * (kernel.dim() - 1))
-        kernel.requires_grad = False
-        if device is not None:
-            kernel = kernel.to(device)
-        self.register_buffer('weight', kernel)
+        self.kernel_size = list(kernel_size)
+        self.sigma = [float(v) for v in sigma]
+        self.padding = [int(size // 2) for size in self.kernel_size]
         self.groups = channels
 
-        if dim == 1:
-            self.conv = F.conv1d
-        elif dim == 2:
-            self.conv = F.conv2d
-        elif dim == 3:
-            self.conv = F.conv3d
-        else:
+        if dim not in (1, 2, 3):
             raise RuntimeError(
-                'Only 1, 2 and 3 dimensions are supported. Received {}.'.format(dim)
+                f'Only 1, 2 and 3 dimensions are supported. Received {dim}.'
             )
+
+        derivative_axis = None
+        if order == 'x':
+            derivative_axis = dim - 1
+        elif order == 'y':
+            derivative_axis = dim - 2
+        elif order == 'z':
+            derivative_axis = dim - 3
+        self.derivative_axis = derivative_axis
+
+        for axis in range(dim):
+            kernel_1d = self._make_axis_kernel(
+                size=self.kernel_size[axis],
+                std=self.sigma[axis],
+                derivative=(axis == derivative_axis),
+            )
+            weight = self._reshape_axis_kernel(kernel_1d, dim, axis, channels)
+            if device is not None:
+                weight = weight.to(device)
+            self.register_buffer(f'weight_{axis}', weight)
+
+    @staticmethod
+    def _make_axis_kernel(size, std, derivative):
+        pad = size // 2
+        coords = torch.arange(-pad, pad + 1, dtype=torch.float32)
+        kernel = 1 / (std * math.sqrt(2 * math.pi)) * torch.exp(-(coords / std) ** 2 / 2)
+        kernel = kernel / torch.sum(kernel)
+        if derivative:
+            kernel = -coords / (std**2) * kernel
+        return kernel
+
+    @staticmethod
+    def _reshape_axis_kernel(kernel_1d, dim, axis, channels):
+        shape = [1] * dim
+        shape[axis] = kernel_1d.numel()
+        kernel = kernel_1d.view(1, 1, *shape)
+        kernel = kernel.repeat(channels, *[1] * (kernel.dim() - 1))
+        kernel.requires_grad = False
+        return kernel
+
+    def _pad_for_axis(self, x, axis):
+        pad = self.padding[axis]
+        if pad == 0:
+            return x
+        if self.dim == 1:
+            return F.pad(x, (pad, pad), mode='reflect')
+        if self.dim == 2:
+            if axis == 0:
+                return F.pad(x, (0, 0, pad, pad), mode='reflect')
+            return F.pad(x, (pad, pad, 0, 0), mode='reflect')
+        if axis == 0:
+            return F.pad(x, (0, 0, 0, 0, pad, pad), mode='reflect')
+        if axis == 1:
+            return F.pad(x, (0, 0, pad, pad, 0, 0), mode='reflect')
+        return F.pad(x, (pad, pad, 0, 0, 0, 0), mode='reflect')
+
+    def _convolve_axis(self, x, axis):
+        if axis == self.derivative_axis:
+            return self._convolve_derivative_axis(x, axis)
+
+        weight = getattr(self, f'weight_{axis}')
+        x = self._pad_for_axis(x, axis)
+        if self.dim == 1:
+            return F.conv1d(x, weight=weight, groups=self.groups)
+        if self.dim == 2:
+            return F.conv2d(x, weight=weight, groups=self.groups)
+        return F.conv3d(x, weight=weight, groups=self.groups)
+
+    def _convolve_derivative_axis(self, x, axis):
+        """Apply an antisymmetric derivative kernel with exact pair cancellation."""
+        pad = self.padding[axis]
+        if pad == 0:
+            return torch.zeros_like(x)
+
+        padded = self._pad_for_axis(x, axis)
+        spatial_axis = x.ndim - self.dim + axis
+        axis_size = x.shape[spatial_axis]
+        weight = getattr(self, f'weight_{axis}')
+        channel_axis = x.ndim - self.dim - 1
+        coefficient_shape = [1] * x.ndim
+        coefficient_shape[channel_axis] = weight.shape[0]
+        output = torch.zeros_like(x)
+
+        weight_index = [slice(None), 0, *([0] * self.dim)]
+        left_index = [slice(None)] * padded.ndim
+        right_index = [slice(None)] * padded.ndim
+        for offset in range(1, pad + 1):
+            weight_index[axis + 2] = pad - offset
+            coefficient = weight[tuple(weight_index)].reshape(
+                tuple(coefficient_shape)
+            )
+            left_index[spatial_axis] = slice(
+                pad - offset,
+                pad - offset + axis_size,
+            )
+            right_index[spatial_axis] = slice(
+                pad + offset,
+                pad + offset + axis_size,
+            )
+            output = output + coefficient * (
+                padded[tuple(left_index)] - padded[tuple(right_index)]
+            )
+        return output
 
     def forward(self, x):
         """
@@ -98,8 +157,7 @@ class GaussianSmoothing(nn.Module):
         Returns:
             filtered (torch.Tensor): Filtered output.
         """
-        if self.dim == 2:
-            x = F.pad(x, (self.padd, self.padd, self.padd, self.padd), mode='reflect')
-        else:
-            x = F.pad(x, (self.padd, self.padd, self.padd, self.padd, self.padd, self.padd), mode='reflect')
-        return -self.conv(x, weight=self.weight, groups=self.groups)
+        out = x
+        for axis in range(self.dim):
+            out = self._convolve_axis(out, axis)
+        return -out

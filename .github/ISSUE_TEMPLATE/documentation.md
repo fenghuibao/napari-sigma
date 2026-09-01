@@ -1,6 +1,6 @@
 ---
 name: "\U0001F4DA Documentation"
-about: Report an issue with segment-any-confocal-images documentation
+about: Report an issue with SIGMA documentation
 title: ''
 labels: documentation
 assignees: ''

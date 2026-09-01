@@ -1,6 +1,6 @@
 ---
 name: "\U0001F680 Feature Request"
-about: Submit a proposal/request for a new segment-any-confocal-images feature
+about: Propose a new SIGMA feature
 title: ''
 labels: feature
 assignees: ''

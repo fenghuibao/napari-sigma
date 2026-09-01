@@ -1,0 +1,25 @@
+name: napari-sigma
+display_name: Structurally-aware Intensity-ordered GMM-MRF Algorithm
+contributions:
+  commands:
+    - id: napari-sigma.widget
+      title: Open SIGMA
+      python_name: napari_sigma._widget:SIGMAWidget
+    - id: napari-sigma.write_single
+      title: Save SIGMA layer with metadata
+      python_name: napari_sigma._writer:write_single_image
+    - id: napari-sigma.reader
+      title: Read SIGMA-supported image
+      python_name: napari_sigma._widget:napari_get_reader
+  widgets:
+    - command: napari-sigma.widget
+      display_name: SIGMA
+  readers:
+    - command: napari-sigma.reader
+      filename_patterns: ["*.tif", "*.tiff", "*.png", "*.jpg", "*.jpeg"]
+      accepts_directories: false
+  writers:
+    - command: napari-sigma.write_single
+      layer_types: ["image", "labels"]
+      filename_extensions: [".tif", ".tiff", ".png", ".jpg", ".jpeg"]
+      display_name: Save SIGMA layer with metadata

@@ -40,6 +40,9 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 nosetests.xml
 coverage.xml
 *,cover
@@ -80,5 +83,5 @@ venv/
 # OS
 .DS_Store
 
-# written by setuptools_scm
-**/_version.py
+# Local AI-assistant worktrees
+.claude/
