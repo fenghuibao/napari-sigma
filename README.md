@@ -25,19 +25,19 @@ Create a clean environment and install the published napari plugin:
 conda create -n sigma python=3.11
 conda activate sigma
 pip install --upgrade "napari-sigma[all]"
-napari
+napari-sigma
 ```
 
-The `all` extra installs a compatible napari 0.9 release with the PyQt6 backend and napari's optional runtime dependencies. Then select **SIGMA** from napari's **Plugins** menu.
+The `all` extra installs a compatible napari 0.9 release with the PyQt6 backend and napari's optional runtime dependencies. The `napari-sigma` launcher selects PyQt6 before napari imports Qt and ignores inherited plugin paths from other Qt installations for that process. Then select **SIGMA** from napari's **Plugins** menu.
 
-Do not install an older `napari-sigma[all]` and then upgrade only the `napari` package: pip does not automatically remove the Qt5 backend selected by an older napari release. If an existing environment contains PyQt5, clean it once before reinstalling SIGMA:
+For an existing installation, upgrade the complete extra rather than upgrading only napari:
 
 ```bash
-python -m pip uninstall -y PyQt5 PyQt5-Qt5 PyQt5-sip
 python -m pip install --upgrade "napari-sigma[all]"
+napari-sigma
 ```
 
-A fresh environment remains the recommended installation path. Environment variables such as `QT_API`, `QT_PLUGIN_PATH`, or `QT_QPA_PLATFORM_PLUGIN_PATH` can override backend discovery and should not be globally fixed to a different Qt installation.
+PyQt5 does not normally need to be uninstalled: the launcher selects PyQt6 and its matching plugins before napari starts. It configures Qt only inside its own process and does not modify global environment variables. A fresh environment remains the safest recovery path for an environment with unrelated binary-level Qt conflicts. The standard `napari` command remains available when another backend is preferred.
 
 ### Development installation
 
@@ -47,7 +47,7 @@ From the repository root:
 conda create -n sigma-dev python=3.11
 conda activate sigma-dev
 pip install -e ".[all]"
-napari
+napari-sigma
 ```
 
 ## Input data

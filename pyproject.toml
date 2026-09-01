@@ -55,6 +55,9 @@ Homepage = "https://github.com/fenghuibao/napari-sigma"
 Repository = "https://github.com/fenghuibao/napari-sigma"
 Issues = "https://github.com/fenghuibao/napari-sigma/issues"
 
+[project.scripts]
+napari-sigma = "napari_sigma._launcher:main"
+
 [project.entry-points."napari.manifest"]
 napari-sigma = "napari_sigma:napari.yaml"
 
