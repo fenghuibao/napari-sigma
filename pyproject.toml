@@ -53,9 +53,9 @@ dependencies = [
 all = ["napari[all]"]
 
 [project.urls]
-Homepage = "https://github.com/fenghuibao/segment-any-confocal-images"
-Repository = "https://github.com/fenghuibao/segment-any-confocal-images"
-Issues = "https://github.com/fenghuibao/segment-any-confocal-images/issues"
+Homepage = "https://github.com/fenghuibao/napari-sigma"
+Repository = "https://github.com/fenghuibao/napari-sigma"
+Issues = "https://github.com/fenghuibao/napari-sigma/issues"
 
 [project.entry-points."napari.manifest"]
 napari-sigma = "napari_sigma:napari.yaml"
