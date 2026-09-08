@@ -48,6 +48,15 @@ python -m pip install --upgrade "napari-sigma[all]"
 
 If other applications in the same environment need OpenCV's own GUI, use a separate environment for SIGMA instead.
 
+On minimal Ubuntu/Debian installations, Qt also needs system libraries that pip does not supply:
+
+```bash
+sudo apt-get install libegl1 libopengl0 libdbus-1-3 libxcb-cursor0 \
+  libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+  libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0 \
+  libxkbcommon-x11-0
+```
+
 ### Development installation
 
 From the repository root:
