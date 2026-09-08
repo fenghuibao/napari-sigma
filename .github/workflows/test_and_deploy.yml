@@ -27,8 +27,6 @@ jobs:
       contents: read
     env:
       QT_API: pyqt6
-      NUMBA_CACHE_DIR: ${{ runner.temp }}/sigma-numba
-      MPLCONFIGDIR: ${{ runner.temp }}/sigma-matplotlib
       LIBGL_ALWAYS_SOFTWARE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -46,9 +44,15 @@ jobs:
           python -m pip install -e ".[all]"
       - name: Test on Linux virtual display
         if: runner.os == 'Linux'
+        env:
+          NUMBA_CACHE_DIR: ${{ runner.temp }}/sigma-numba
+          MPLCONFIGDIR: ${{ runner.temp }}/sigma-matplotlib
         run: xvfb-run -a python -m unittest discover -s tests -v
       - name: Test on macOS
         if: runner.os == 'macOS'
+        env:
+          NUMBA_CACHE_DIR: ${{ runner.temp }}/sigma-numba
+          MPLCONFIGDIR: ${{ runner.temp }}/sigma-matplotlib
         run: python -m unittest discover -s tests -v
 
   build:
