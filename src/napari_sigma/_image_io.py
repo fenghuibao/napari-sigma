@@ -15,6 +15,7 @@ SUPPORTED_IMAGE_SUFFIXES = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 _UNIT_TO_UM = {
     "um": 1.0,
     "µm": 1.0,
+    "μm": 1.0,
     "micron": 1.0,
     "microns": 1.0,
     "nm": 1e-3,
@@ -154,7 +155,10 @@ def _read_tiff_scale_metadata(path: str) -> tuple[tuple[float, float, float], st
     extras: dict[str, Any] = {}
     with tifffile.TiffFile(path) as tif:
         page = tif.pages[0]
-        imagej_meta = tif.imagej_metadata or {}
+        # tifffile stores non-ImageJ metadata in shaped JSON (e.g. uint32 labels).
+        shaped = tif.shaped_metadata or ()
+        imagej_meta = dict(shaped[0] or {}) if shaped else {}
+        imagej_meta.update(tif.imagej_metadata or {})
         ome_sizes, ome_time_interval = _read_ome_pixels_metadata(tif.ome_metadata)
         extras["layer_type"] = imagej_meta.get("layer_type")
         for metadata_key in ("sigma_metadata", "bistate_metadata"):
@@ -164,7 +168,8 @@ def _read_tiff_scale_metadata(path: str) -> tuple[tuple[float, float, float], st
             with suppress(json.JSONDecodeError, TypeError, ValueError):
                 decoded = json.loads(serialized_metadata)
                 if isinstance(decoded, dict):
-                    extras.update(decoded)
+                    extras.update({key: value for key, value in decoded.items()
+                                   if key not in {"dims", "dims_out", "scale_per_axis", "storage_dims", "source", "axes", "layer_type"}})
         if "sigma_layer_role" not in extras and "bistate_layer_role" in extras:
             extras["sigma_layer_role"] = extras.pop("bistate_layer_role")
         if "sigma_saved_structure" not in extras and "bistate_saved_structure" in extras:

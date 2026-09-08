@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
 from time import sleep
-from types import MethodType
+from types import MethodType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -78,6 +78,7 @@ from ._analysis import (
     write_analysis_export_file,
 )
 from ._proximity import (
+    ProximityCancelledError,
     ProximityResult,
     ProximityRoiSpec,
     _proximity_roi_label_mask,
@@ -88,7 +89,6 @@ from ._proximity import (
     is_proximity_segmentation_candidate_layer,
 )
 from ._image_io import (
-    SUPPORTED_IMAGE_SUFFIXES,
     load_image_tc_zyx,
 )
 from ._layer_candidates import is_binary_mask_data
@@ -106,6 +106,8 @@ from ._tracking import (
     track_segmentations_ilp,
 )
 from ._writer import write_single_image
+from ._reader import napari_get_reader as napari_get_reader, tczyx_to_layer_data  # legacy import path
+from ._metadata import layer_dims_tag as _layer_dims_tag, unit_from_metadata
 
 
 def _prefer_numba_workqueue() -> None:
@@ -620,7 +622,7 @@ def _get_source_from_layer(layer) -> str | None:
 
 
 def _ensure_unit_in_metadata(md: dict[str, Any]) -> str:
-    unit = md.get("PhysicalSizeXUnit") or md.get("unit") or md.get("Units") or "um"
+    unit = unit_from_metadata(md)
     md["unit"] = unit
     return unit
 
@@ -634,15 +636,6 @@ def _ensure_group_id(md: dict[str, Any], fallback: str | None = None) -> str:
 def _mark_plugin_managed(md: dict[str, Any]) -> dict[str, Any]:
     md["managed_by_plugin"] = True
     return md
-
-
-def _layer_dims_tag(layer) -> str | None:
-    md = getattr(layer, "metadata", {}) or {}
-    # Derived layers describe their displayed axes with ``dims_out``. Prefer
-    # that value over source ``dims`` so a TZYX result cannot be reinterpreted
-    # as a single ZYX volume when it is selected again.
-    dims = md.get("dims_out") or md.get("dims") or md.get("inferred_dims")
-    return str(dims).upper() if dims else None
 
 
 def _layer_display_ndim(layer) -> int:
@@ -1268,6 +1261,29 @@ class SegWorker(QObject):
             self.finished.emit(None, e)
 
 
+class ProximityWorker(QObject):
+    finished = Signal(object, object)
+
+    def __init__(self, layers, kwargs):
+        super().__init__()
+        # Snapshot layer properties on the GUI thread, not inside run().
+        self.layers = [SimpleNamespace(data=layer.data, metadata=dict(layer.metadata), name=layer.name)
+                       for layer in layers]
+        self.kwargs = kwargs
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            result = compute_proximity_result(*self.layers, **self.kwargs,
+                                              cancel_check=lambda: self._cancelled)
+            self.finished.emit(result, None)
+        except Exception as exc:
+            self.finished.emit(None, exc)
+
+
 class FrangiWorker(QObject):
     finished = Signal(object, object)  # (payload, error)
     started = Signal()
@@ -1768,6 +1784,13 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
     def __init__(self, napari_viewer):
         super().__init__()
+        self._disposed = False
+        self._hooks_installed = False
+        self._viewer_connections = []
+        self._menu_patch = None
+        self._zoom_callback = None
+        self._dock_widget = None
+        self._ui_ready = False
         _prefer_numba_workqueue()
         self._main_thread_dispatch.connect(
             self._execute_main_thread_callback,
@@ -1942,6 +1965,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._gaussian_worker = None
         self._seg_thread = None
         self._seg_worker = None
+        self._proximity_thread = None
+        self._proximity_worker = None
         self._panel_tabs = None
         self._initial_panel_width_applied = False
 
@@ -1979,26 +2004,12 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         outer.addWidget(scroll)
 
         # ---- listeners -------------------------------------------------
-        self.viewer.layers.events.inserted.connect(self._on_layer_inserted)
-        self.viewer.layers.events.removed.connect(self._update_info)
-        self.viewer.layers.selection.events.active.connect(self._on_active_changed)
-        with suppress(Exception):
-            self.viewer.dims.events.current_step.connect(self._on_dims_step_changed)
-        self._disable_double_click_zoom()
-        if (
-            self._on_analysis_viewer_double_click
-            not in self.viewer.mouse_double_click_callbacks
-        ):
-            self.viewer.mouse_double_click_callbacks.append(
-                self._on_analysis_viewer_double_click
-            )
+        self._install_viewer_hooks()
 
         # initial state
         self._configure_responsive_ui()
         self._update_info()
         self._fit_view_and_scalebar()
-        self._patch_open_and_drop()
-        self._patch_layer_list_context_menu()
         self._disable_wheel_adjustment_on_inputs()
         self._analysis_refresh_timer = QTimer(self)
         self._analysis_refresh_timer.setSingleShot(True)
@@ -2016,6 +2027,86 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         QTimer.singleShot(0, self._sync_panel_tab_height)
         QTimer.singleShot(0, self._normalize_existing_layers_on_startup)
         QTimer.singleShot(0, self._apply_initial_panel_width)
+        self._ui_ready = True
+
+    def _install_viewer_hooks(self) -> None:
+        if self._hooks_installed:
+            return
+        self._disposed = False
+        self._viewer_connections = [
+            (self.viewer.layers.events.inserted, self._on_layer_inserted),
+            (self.viewer.layers.events.removed, self._update_info),
+            (self.viewer.layers.selection.events.active, self._on_active_changed),
+            (self.viewer.dims.events.current_step, self._on_dims_step_changed),
+        ]
+        for emitter, callback in self._viewer_connections:
+            emitter.connect(callback)
+        self._disable_double_click_zoom()
+        if self._on_analysis_viewer_double_click not in self.viewer.mouse_double_click_callbacks:
+            self.viewer.mouse_double_click_callbacks.append(self._on_analysis_viewer_double_click)
+        self._patch_layer_list_context_menu()
+        self._hooks_installed = True
+
+    def dispose(self) -> None:
+        """Stop work and release only hooks owned by this panel; safe to repeat."""
+        if self._disposed:
+            return
+        self._disposed = True
+        for timer in self.findChildren(QTimer):
+            timer.stop()
+        for name in ("analysis", "analysis_export", "tracking", "frangi", "upsample",
+                     "denoise", "gaussian", "seg", "proximity"):
+            thread_attr, worker_attr = f"_{name}_thread", f"_{name}_worker"
+            self._request_worker_cancel(thread_attr, worker_attr)
+            self._cleanup_worker_thread(thread_attr, worker_attr)
+        for emitter, callback in self._viewer_connections:
+            with suppress(Exception):
+                emitter.disconnect(callback)
+        self._viewer_connections.clear()
+        if self._scale_conn is not None:
+            with suppress(Exception):
+                self._scale_conn[0].disconnect(self._scale_conn[1])
+            self._scale_conn = None
+        with suppress(ValueError):
+            self.viewer.mouse_double_click_callbacks.remove(self._on_analysis_viewer_double_click)
+        if self._zoom_callback is not None and self._zoom_callback not in self.viewer.mouse_double_click_callbacks:
+            self.viewer.mouse_double_click_callbacks.append(self._zoom_callback)
+        self._zoom_callback = None
+        if self._menu_patch is not None:
+            delegate, original, installed = self._menu_patch
+            with suppress(RuntimeError, AttributeError):
+                if delegate.show_context_menu == installed:
+                    delegate.show_context_menu = original
+                    delegate._segment_any_save_menu_patched = False
+                    menu = getattr(delegate, "_context_menu", None)
+                    if menu is not None:
+                        for action in list(menu.actions()):
+                            if action.property("segment_any_save_action") or action.property("segment_any_save_separator"):
+                                menu.removeAction(action)
+                                action.deleteLater()
+            self._menu_patch = None
+        self._hooks_installed = False
+
+    def event(self, event):
+        if event.type() == QEvent.ParentChange and getattr(self, "_ui_ready", False):
+            parent = self.parentWidget()
+            if isinstance(parent, QDockWidget):
+                self._dock_widget = parent
+                parent.installEventFilter(self)
+                self._install_viewer_hooks()
+            elif parent is None and self._dock_widget is not None:
+                self._dock_widget = None
+                self.dispose()
+        return super().event(event)
+
+    def closeEvent(self, event):
+        self.dispose()
+        super().closeEvent(event)
+
+    def showEvent(self, event):
+        if self._ui_ready and self._disposed:
+            self._install_viewer_hooks()
+        super().showEvent(event)
 
     def _disable_double_click_zoom(self) -> None:
         with suppress(ValueError, AttributeError, ImportError, RuntimeError):
@@ -2023,13 +2114,15 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 double_click_to_zoom,
             )
             self.viewer.mouse_double_click_callbacks.remove(double_click_to_zoom)
+            self._zoom_callback = double_click_to_zoom
 
     def _thread_is_running(self, attr_name: str) -> bool:
         thread = getattr(self, attr_name, None)
         return bool(thread is not None and thread.isRunning())
 
     def _execute_main_thread_callback(self, callback, args) -> None:
-        callback(*tuple(args))
+        if not self._disposed:
+            callback(*tuple(args))
 
     def _connect_worker_callback(self, signal, callback) -> None:
         signal.connect(
@@ -2299,6 +2392,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 self._analysis_export_progress.hide()
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if obj is self._dock_widget:
+            if event.type() == QEvent.Close:
+                self.dispose()
+            elif event.type() == QEvent.Show and self._ui_ready and self._disposed:
+                self._install_viewer_hooks()
         if event.type() == QEvent.Wheel:
             plot_viewport = (
                 self._analysis_plot_scroll.viewport()
@@ -2369,6 +2467,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             QTimer.singleShot(0, self._try_patch_layer_list_context_menu)
 
     def _try_patch_layer_list_context_menu(self) -> bool:
+        if self._disposed:
+            return False
         with suppress(AttributeError, RuntimeError):
             from napari._app_model.constants import MenuId
             from napari._app_model.context import get_context
@@ -2399,7 +2499,10 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 if chosen is save_action:
                     self._save_active_layer_with_metadata()
 
-            delegate.show_context_menu = MethodType(_patched_show_context_menu, delegate)
+            original = delegate.show_context_menu
+            installed = MethodType(_patched_show_context_menu, delegate)
+            delegate.show_context_menu = installed
+            self._menu_patch = (delegate, original, installed)
             delegate._segment_any_save_menu_patched = True
             return True
         return False
@@ -2468,6 +2571,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     def _on_panel_tab_changed(self, *_args) -> None:
         self._sync_panel_tab_height()
         if self._panel_tabs is not None and self._panel_tabs.currentWidget() is self._analysis_tab:
+            if self._ensure_analysis_plot():
+                self._plot_distributions(getattr(self, "_analysis_pending_plot_info", None))
             with suppress(Exception):
                 self._schedule_analysis_refresh_for_current_frame(force=False)
         scroll = getattr(self, "_scroll", None)
@@ -3634,25 +3739,6 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._update_info()
         return layers
 
-    def _sync_existing_tczyx_group(self, layer, source: str):
-        _safe_axis_labels(self.viewer, layer)
-        t_size = _time_size_from_layer(layer)
-        same_source_layers = [
-            layer_item for layer_item in self.viewer.layers if getattr(layer_item, "metadata", {}).get("source") == source
-        ]
-        group_id = next((_get_group_id(layer_item) for layer_item in same_source_layers if _get_group_id(layer_item)), None)
-        group_id = group_id or uuid4().hex
-        for layer_item in same_source_layers:
-            md_same = dict(getattr(layer_item, "metadata", {}) or {})
-            md_same["group_id"] = group_id
-            layer_item.metadata = md_same
-        self._group_layers = same_source_layers
-        self._set_ct_controls(T=t_size, C=len(same_source_layers))
-        self._set_z_range_for_data(layer)
-        self._configure_scale_bar(_get_units_from_layer(layer))
-        self._set_default_display_mode_for_imported_layer(layer)
-        self._view_initialized = False
-        self._fit_view_and_scalebar()
 
     def _sync_single_layer(self, layer):
         with suppress(Exception):
@@ -3712,154 +3798,18 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         return np.squeeze(arr)
 
     def _add_tczyx_image_layers(self, data_tc_zyx: np.ndarray, meta: dict[str, Any], name: str):
-        if meta.get("layer_type") == "labels":
-            label_data = np.asarray(data_tc_zyx)
-            while label_data.ndim > 2 and label_data.shape[0] == 1:
-                label_data = label_data[0]
-            label_units = _metadata_units_for_ndim(meta, label_data.ndim)
-            label_kwargs = {}
-            if label_units is not None:
-                label_kwargs["units"] = label_units
-            added = self.viewer.add_labels(
-                label_data.astype(np.int32, copy=False),
-                name=name,
-                metadata=dict(meta),
-                visible=True,
-                **label_kwargs,
-            )
-            sc5 = tuple(meta.get("scale_per_axis", (1, 1, 1, 1, 1)))
-            if added.data.ndim >= 3:
-                sc = (sc5[-3], sc5[-2], sc5[-1])
-                dims_tag = "ZYX"
-            else:
-                sc = (sc5[-2], sc5[-1])
-                dims_tag = "YX"
-            added.scale = sc
-            md = dict(getattr(added, "metadata", {}) or {})
-            md.setdefault("unit", meta.get("unit", "um"))
-            md.setdefault("source", meta.get("source"))
-            md["dims"] = dims_tag
-            md["layer_type"] = "labels"
-            md["group_id"] = meta.get("group_id", uuid4().hex)
-            md["managed_by_plugin"] = True
-            added.metadata = md
-            self._group_layers = [added]
-            return [added]
-
-        source_axes = str(meta.get("axes") or "").upper()
-        if source_axes == "TZCYX" and str(meta.get("storage_dims") or "").upper() == "TZCYX":
-            t_size = int(data_tc_zyx.shape[0])
-            z_size = int(data_tc_zyx.shape[1])
-            c_size = int(data_tc_zyx.shape[2])
-
-            layer_input = data_tc_zyx
-            channel_axis = 2
-            dims_tag = "TCZYX"
-            if t_size == 1 and c_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[0, 0, 0]
-                channel_axis = None
-                dims_tag = "YX"
-            elif t_size == 1 and c_size == 1:
-                layer_input = data_tc_zyx[0, :, 0]
-                channel_axis = None
-                dims_tag = "ZYX"
-            elif t_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[0, 0]
-                channel_axis = 0
-                dims_tag = "CYX"
-            elif t_size == 1:
-                layer_input = data_tc_zyx[0]
-                channel_axis = 1
-                dims_tag = "CZYX"
-            elif c_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[:, 0, 0]
-                channel_axis = None
-                dims_tag = "TYX"
-            elif c_size == 1:
-                layer_input = data_tc_zyx[:, :, 0]
-                channel_axis = None
-                dims_tag = "TZYX"
-        else:
-            t_size = int(data_tc_zyx.shape[0])
-            c_size = int(data_tc_zyx.shape[1])
-            z_size = int(data_tc_zyx.shape[2])
-
-            layer_input = data_tc_zyx
-            channel_axis = 1
-            dims_tag = "TCZYX"
-            if t_size == 1 and c_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[0, 0, 0]
-                channel_axis = None
-                dims_tag = "YX"
-            elif t_size == 1 and c_size == 1:
-                layer_input = data_tc_zyx[0, 0]
-                channel_axis = None
-                dims_tag = "ZYX"
-            elif t_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[0, :, 0]
-                channel_axis = 0
-                dims_tag = "CYX"
-            elif t_size == 1:
-                layer_input = data_tc_zyx[0]
-                channel_axis = 0
-                dims_tag = "CZYX"
-            elif c_size == 1 and z_size == 1:
-                layer_input = data_tc_zyx[:, 0, 0]
-                channel_axis = None
-                dims_tag = "TYX"
-            elif c_size == 1:
-                layer_input = data_tc_zyx[:, 0]
-                channel_axis = None
-                dims_tag = "TZYX"
-
-        add_kwargs = {
-            "name": name,
-            "rgb": False,
-            "blending": "additive",
-            "visible": True,
-            "metadata": dict(meta),
-        }
-        if channel_axis is not None:
-            add_kwargs["channel_axis"] = channel_axis
-        output_ndim = int(np.asarray(layer_input).ndim) - (1 if channel_axis is not None else 0)
-        image_units = _metadata_units_for_ndim(meta, output_ndim)
-        if image_units is not None:
-            add_kwargs["units"] = image_units
-        added = self.viewer.add_image(layer_input, **add_kwargs)
-        layers = _as_list(added)
+        """Use the same axis/type conversion as the registered lightweight reader."""
+        gid = meta.get("group_id") or uuid4().hex
+        layers = []
+        for data, kwargs, kind in tczyx_to_layer_data(data_tc_zyx, meta, name):
+            md = kwargs["metadata"]
+            md.update(group_id=gid, managed_by_plugin=True, layer_type=kind)
+            units = _metadata_units_for_ndim(md, data.ndim)
+            if units is not None:
+                kwargs["units"] = units
+            layer = getattr(self.viewer, f"add_{kind}")(data, visible=True, **kwargs)
+            layers.append(layer)
         self._group_layers = layers
-
-        sc5 = tuple(meta.get("scale_per_axis", (1, 1, 1, 1, 1)))
-        unit = meta.get("unit", "um")
-        ch_names = meta.get("channel_names") or [f"Channel {i+1}" for i in range(len(layers))]
-        gid = meta.get("group_id", uuid4().hex)
-
-        for i, layer_item in enumerate(layers):
-            if layer_item.data.ndim >= 4:
-                sc = (sc5[0], sc5[-3], sc5[-2], sc5[-1])
-            elif layer_item.data.ndim == 3:
-                sc = (
-                    (sc5[0], sc5[-2], sc5[-1])
-                    if dims_tag == "TYX"
-                    else (sc5[-3], sc5[-2], sc5[-1])
-                )
-            else:
-                sc = (sc5[-2], sc5[-1])
-            try:
-                layer_item.scale = sc
-            except (TypeError, ValueError, AttributeError, RuntimeError):
-                layer_item.scale = (1.0,) * (layer_item.data.ndim - 3) + (sc5[-3], sc5[-2], sc5[-1])
-
-            md = dict(getattr(layer_item, "metadata", {}) or {})
-            md.setdefault("unit", unit)
-            md["dims"] = dims_tag
-            md.setdefault("source", meta.get("source"))
-            md["group_id"] = gid
-            md["channel_index"] = i
-            md["channel_name"] = ch_names[i] if i < len(ch_names) else f"Channel {i+1}"
-            md["managed_by_plugin"] = True
-            layer_item.metadata = md
-
         return layers
 
     # -----------------------------------------------------------------
@@ -3939,6 +3889,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         compute_roi_btn = QPushButton("Compute ROI(s)")
         compute_roi_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         compute_roi_btn.clicked.connect(self._on_compute_proximity_roi_clicked)
+        self._proximity_compute_buttons = (compute_full_btn, compute_roi_btn)
         compute_row.addWidget(compute_full_btn, 1)
         compute_row.addWidget(compute_roi_btn, 1)
         ctrl_grid.addLayout(compute_row, 5, 0, 1, 2)
@@ -7770,8 +7721,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._compute_proximity(use_roi=True)
 
     def _compute_proximity(self, *, use_roi: bool) -> None:
-        with suppress(Exception):
-            QApplication.processEvents()
+        if self._thread_is_running("_proximity_thread"):
+            self._request_worker_cancel("_proximity_thread", "_proximity_worker")
+            return
         roi_layer = self._proximity_roi_layer
         if (
             roi_layer is not None
@@ -7827,22 +7779,41 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                     "The ROI is incomplete or outside the image. Clear it and draw a new polygon.",
                 )
                 return
-        try:
-            spatial_ndim = self._proximity_spatial_ndim(source_seg_layer)
-            result = compute_proximity_result(
-                source_raw_layer,
-                source_seg_layer,
-                target_raw_layer,
-                target_seg_layer,
-                roi_specs=roi_specs,
-                voxel_size=_get_pixel_size_tuple(source_seg_layer, spatial_ndim),
-                unit=_get_units_from_layer(source_seg_layer),
-                distance_threshold=0.0,
-                surface_only=False,
-            )
-        except (TypeError, ValueError, RuntimeError) as e:
-            QMessageBox.critical(self, "Proximity failed", f"Failed to compute proximity: {e!r}")
-            return
+        spatial_ndim = self._proximity_spatial_ndim(source_seg_layer)
+        layers = (source_raw_layer, source_seg_layer, target_raw_layer, target_seg_layer)
+        kwargs = dict(
+            roi_specs=roi_specs,
+            voxel_size=_get_pixel_size_tuple(source_seg_layer, spatial_ndim),
+            unit=_get_units_from_layer(source_seg_layer),
+            distance_threshold=0.0,
+            surface_only=False,
+        )
+        thread = QThread(self)
+        worker = ProximityWorker(layers, kwargs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        self._proximity_thread, self._proximity_worker = thread, worker
+        for button in self._proximity_compute_buttons:
+            button.setText("Stop Proximity")
+
+        def finished(result, error):
+            self._cleanup_worker_thread("_proximity_thread", "_proximity_worker")
+            for button, title in zip(self._proximity_compute_buttons, ("Compute Full Image", "Compute ROI(s)")):
+                button.setText(title)
+            if isinstance(error, ProximityCancelledError):
+                return
+            if error is not None:
+                QMessageBox.critical(self, "Proximity failed", f"Failed to compute proximity: {error!r}")
+                return
+            if not all(layer in self.viewer.layers for layer in layers):
+                return
+            self._finish_proximity_result(result, layers, use_roi, spatial_ndim)
+
+        self._connect_worker_callback(worker.finished, finished)
+        thread.start()
+
+    def _finish_proximity_result(self, result, layers, use_roi, spatial_ndim):
+        source_raw_layer, source_seg_layer, target_raw_layer, target_seg_layer = layers
         self._apply_proximity_role_colors(source_raw_layer, source_seg_layer, target_raw_layer, target_seg_layer)
         self._proximity_result = result
         self._populate_proximity_tables(result)
@@ -11736,96 +11707,12 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     # Open / drop interception & unified loader with 0–255 display rescale
     # -----------------------------------------------------------------
 
-    def _patch_open_and_drop(self):
-        """Intercept drop/open and route supported image files through our loader."""
-        try:
-            qt = self.viewer.window._qt_viewer
-        except (AttributeError, RuntimeError):
-            return
-
-        # Wrap _qt_open
-        if hasattr(qt, "_qt_open") and not hasattr(self, "_orig__qt_open"):
-            self._orig__qt_open = qt._qt_open
-
-            def _wrapped__qt_open(filenames, stack=False, choose_plugin=False, plugin=None, layer_type=None, **kwargs):
-                try:
-                    one_file = (
-                        (isinstance(filenames, list | tuple) and len(filenames) == 1)
-                        or isinstance(filenames, str)
-                    )
-                    if one_file and self._try_open_supported_image(
-                        filenames, stack=stack, choose_plugin=choose_plugin, **kwargs
-                    ):
-                        return []
-                except (TypeError, ValueError, AttributeError, RuntimeError):
-                    pass
-                return self._orig__qt_open(
-                    filenames,
-                    stack=stack,
-                    choose_plugin=choose_plugin,
-                    plugin=plugin,
-                    layer_type=layer_type,
-                    **kwargs,
-                )
-
-            qt._qt_open = _wrapped__qt_open
-
-        # Wrap dropEvent
-        if hasattr(qt, "dropEvent") and not hasattr(self, "_orig_dropEvent"):
-            self._orig_dropEvent = qt.dropEvent
-
-            def _custom_drop(ev):
-                try:
-                    urls = ev.mimeData().urls()
-                    if urls:
-                        paths = []
-                        for u in urls:
-                            if u.isLocalFile():
-                                paths.append(u.toLocalFile())
-                            else:
-                                s = u.toString()
-                                if s.startswith("file://"):
-                                    paths.append(s[7:])
-                        if len(paths) == 1 and paths[0].lower().endswith(SUPPORTED_IMAGE_SUFFIXES) and self._try_open_supported_image(paths[0]):
-                            ev.acceptProposedAction()
-                            return
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
-                return self._orig_dropEvent(ev)
-
-            qt.dropEvent = _custom_drop
 
     def _normalize_existing_layers_on_startup(self) -> None:
-        active = self.viewer.layers.selection.active
-        candidates = [
-            layer
-            for layer in list(self.viewer.layers)
-            if hasattr(layer, "data") and not _is_analysis_aux_layer(layer)
-        ]
-        for layer in candidates:
-            with suppress(Exception):
-                self._maybe_normalize_dragdrop_layer(layer)
-        if active is not None and active in self.viewer.layers:
-            with suppress(Exception):
-                self.viewer.layers.selection.active = active
-        self._update_info()
+        """Synchronize controls without reloading or replacing existing image data."""
+        if not getattr(self, "_disposed", False):
+            self._update_info()
 
-    def _try_open_supported_image(self, paths, stack=False, choose_plugin=False, **kwargs) -> bool:
-        if isinstance(paths, list | tuple):
-            if len(paths) != 1:
-                return False
-            path = paths[0]
-        else:
-            path = paths
-
-        if not path.lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
-            return False
-
-        try:
-            self._load_and_add_path(path)
-        except (OSError, ValueError, TypeError):
-            return False
-        return True
 
     def _load_and_add_path(self, path: str):
         data_tc_zyx, meta = _load_image_tc_zyx(path)
@@ -11836,26 +11723,10 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     # -----------------------------------------------------------------
 
     def _populate_devices(self):
+        """Select lazily; availability is checked only when computation needs it."""
         self.device_combo.clear()
-        choices = ["cpu"]
-        torch = _get_torch_module()
-        if torch is not None:
-            with suppress(RuntimeError, AssertionError, AttributeError):
-                if torch.cuda.is_available():
-                    choices.append("cuda")
-            with suppress(RuntimeError, AssertionError, AttributeError):
-                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    choices.append("mps")
-        for c in choices:
-            self.device_combo.addItem(c)
-        if "cuda" in choices:
-            self.device_combo.setCurrentText("cuda")
-        elif "mps" in choices:
-            self.device_combo.setCurrentText("mps")
-        else:
-            self.device_combo.setCurrentText("cpu")
-        if hasattr(self, "kw_preview"):
-            self._update_segmentation_preview()
+        self.device_combo.addItems(["auto", "cpu", "cuda", "mps"])
+        self.device_combo.setToolTip("Auto chooses an available GPU. Unavailable devices fall back to CPU.")
 
     def _resolve_device(self) -> str:
         torch = _get_torch_module()
@@ -11921,36 +11792,12 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         QTimer.singleShot(0, _deferred)
 
     def _maybe_normalize_dragdrop_layer(self, layer):
-        md0 = getattr(layer, "metadata", {}) or {}
-        if md0.get("managed_by_plugin"):
-            return
-        if md0.get("is_frangi") or md0.get("is_segmentation") or md0.get("is_denoise"):
-            return
-
-        try:
-            from napari.layers import Image as NapariImage
-            if not isinstance(layer, NapariImage):
-                return
-        except (ImportError, AttributeError):
-            return
-
+        """Respect in-memory data, including edits made by other plugins."""
         src = _get_source_from_layer(layer)
         if src:
             self.path_edit.setText(src)
-        if not src:
-            return
-
-        if (getattr(layer, "metadata", {}) or {}).get("dims") == "TCZYX":
-            self._sync_existing_tczyx_group(layer, src)
-            return
-
-        try:
-            data, meta = _load_image_tc_zyx(src)
-            self._apply_loaded_layers(data, meta, name=self._next_layer_name(os.path.basename(src)), remove_layer=layer)
-            return
-        except (OSError, ValueError, TypeError, RuntimeError, AttributeError):
-            self._reset_processing_state()
-            self._sync_single_layer(layer)
+        # File loading is handled by the registered reader. An insertion event
+        # is not permission to replace a layer from its original file.
 
     # -----------------------------------------------------------------
     # Viewer sync & UI updates
@@ -12002,10 +11849,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
         with suppress(Exception):
             if self._scale_conn is not None:
-                self._scale_conn.disconnect()
+                self._scale_conn[0].disconnect(self._scale_conn[1])
 
         if layer is not None and hasattr(layer, "events") and hasattr(layer.events, "scale"):
-            self._scale_conn = layer.events.scale.connect(self._update_info)
+            layer.events.scale.connect(self._update_info)
+            self._scale_conn = (layer.events.scale, self._update_info)
         else:
             self._scale_conn = None
 
@@ -14040,84 +13888,6 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 # napari reader
 # ---------------------------------------------------------------------
 
-def napari_get_reader(paths):
-    if isinstance(paths, list | tuple):
-        if len(paths) != 1:
-            return None
-        path = paths[0]
-    else:
-        path = paths
-    if not path.lower().endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg")):
-        return None
-
-    def _reader(_paths):
-        p = _paths[0] if isinstance(_paths, list | tuple) else _paths
-        data, meta = _load_image_tc_zyx(p)
-        if meta.get("layer_type") == "labels":
-            label_data = np.asarray(data)
-            while label_data.ndim > 2 and label_data.shape[0] == 1:
-                label_data = label_data[0]
-            sc5 = tuple(meta.get("scale_per_axis", (1, 1, 1, 1, 1)))
-            scale = (
-                (sc5[-3], sc5[-2], sc5[-1])
-                if label_data.ndim >= 3
-                else (sc5[-2], sc5[-1])
-            )
-            add_kwargs = {
-                "name": os.path.basename(p),
-                "metadata": dict(meta),
-                "scale": scale,
-            }
-            return [(label_data.astype(np.int32, copy=False), add_kwargs, "labels")]
-        add_kwargs = {
-            "name": os.path.basename(p),
-            "rgb": False,
-            "blending": "additive",
-            "metadata": dict(meta),
-        }
-
-        data = np.asarray(data)
-        sc5 = tuple(meta.get("scale_per_axis", (1, 1, 1, 1, 1)))
-        if data.ndim == 5:
-            t_size, c_size, z_size = (
-                int(data.shape[0]),
-                int(data.shape[1]),
-                int(data.shape[2]),
-            )
-            if t_size == 1 and c_size == 1 and z_size == 1:
-                data = data[0, 0, 0]
-                add_kwargs["metadata"]["dims"] = "YX"
-                add_kwargs["scale"] = (sc5[-2], sc5[-1])
-            elif t_size == 1 and c_size == 1:
-                data = data[0, 0]
-                add_kwargs["metadata"]["dims"] = "ZYX"
-                add_kwargs["scale"] = (sc5[-3], sc5[-2], sc5[-1])
-            elif t_size == 1 and z_size == 1:
-                data = data[0, :, 0]
-                add_kwargs["channel_axis"] = 0
-                add_kwargs["metadata"]["dims"] = "CYX"
-                add_kwargs["scale"] = (sc5[-2], sc5[-1])
-            elif t_size == 1:
-                data = data[0]
-                add_kwargs["channel_axis"] = 0
-                add_kwargs["metadata"]["dims"] = "CZYX"
-                add_kwargs["scale"] = (sc5[-3], sc5[-2], sc5[-1])
-            elif c_size == 1 and z_size == 1:
-                data = data[:, 0, 0]
-                add_kwargs["metadata"]["dims"] = "TYX"
-                add_kwargs["scale"] = (sc5[0], sc5[-2], sc5[-1])
-            elif c_size == 1:
-                data = data[:, 0]
-                add_kwargs["metadata"]["dims"] = "TZYX"
-                add_kwargs["scale"] = (sc5[0], sc5[-3], sc5[-2], sc5[-1])
-            else:
-                add_kwargs["channel_axis"] = 1
-                add_kwargs["metadata"]["dims"] = "TCZYX"
-                add_kwargs["scale"] = (sc5[0], sc5[-3], sc5[-2], sc5[-1])
-
-        return [(data, add_kwargs, "image")]
-
-    return _reader
 
 
 if __name__ == "__main__":  # pragma: no cover

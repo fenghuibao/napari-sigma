@@ -4,10 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import tifffile
 from PIL import Image
+
+from ._metadata import unit_from_metadata
 
 _SUPPORTED_WRITE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".gif", ".mp4"}
 _SIGMA_TIFF_METADATA_KEYS = (
@@ -33,7 +34,7 @@ _SIGMA_TIFF_METADATA_KEYS = (
 
 def _unit_from_meta(meta: dict) -> str:
     layer_meta = meta.get("metadata", {}) or {}
-    return layer_meta.get("PhysicalSizeXUnit") or layer_meta.get("unit") or layer_meta.get("Units") or "um"
+    return unit_from_metadata(layer_meta)
 
 
 def _layer_type_from_meta(meta: dict) -> str:
@@ -50,7 +51,10 @@ def _fps_from_meta(meta: dict) -> float:
 
 
 def _scale_from_meta(meta: dict, ndim: int) -> tuple[float, ...]:
-    scale = tuple(float(v) for v in (meta.get("scale") or (1,) * ndim))
+    raw_scale = meta.get("scale")
+    scale = tuple(float(v) for v in raw_scale) if raw_scale is not None else (1.0,) * ndim
+    if any(not np.isfinite(v) or v <= 0 for v in scale):
+        raise ValueError("Scale values must be finite and positive.")
     if len(scale) >= ndim:
         return scale[-ndim:]
     return (1.0,) * (ndim - len(scale)) + scale
@@ -101,6 +105,8 @@ def _coerce_tiff_dtype(arr: np.ndarray) -> tuple[np.ndarray, bool]:
             return arr.astype(np.uint32, copy=False), False
         if arr_min >= np.iinfo(np.int32).min and arr_max <= np.iinfo(np.int32).max:
             return arr.astype(np.int32, copy=False), False
+        # Preserve large label IDs rather than rounding them through float32.
+        return arr, False
     return arr.astype(np.float32, copy=False), True
 
 
@@ -109,8 +115,14 @@ def _write_tiff(path: str, data: np.ndarray, meta: dict) -> None:
     scale = _scale_from_meta(meta, arr.ndim)
     unit = _unit_from_meta(meta)
     axes = _axes_from_meta(meta, arr.ndim)
-    write_kwargs: dict[str, Any] = {}
     is_rgb = bool(arr.ndim >= 3 and arr.shape[-1] in (3, 4) and axes.endswith("C"))
+    if imagej_ok and not is_rgb and set(axes) <= set("TZCYX") and len(set(axes)) == len(axes):
+        ordered_axes = "".join(axis for axis in "TZCYX" if axis in axes)
+        order = tuple(axes.index(axis) for axis in ordered_axes)
+        arr = arr.transpose(order)
+        scale = tuple(scale[index] for index in order)
+        axes = ordered_axes
+    write_kwargs: dict[str, Any] = {"photometric": "minisblack"}
 
     if "Y" in axes and "X" in axes:
         y_idx = axes.index("Y")
@@ -118,6 +130,8 @@ def _write_tiff(path: str, data: np.ndarray, meta: dict) -> None:
         vy = float(scale[y_idx])
         vx = float(scale[x_idx])
         write_kwargs["resolution"] = (1.0 / max(vx, 1e-12), 1.0 / max(vy, 1e-12))
+        # Pixel calibration is expressed in metadata.unit, never implicitly inches.
+        write_kwargs["resolutionunit"] = "NONE"
     if is_rgb:
         write_kwargs["photometric"] = "rgb"
         imagej_ok = False
@@ -181,6 +195,7 @@ def _write_gif(path: str, data: np.ndarray, meta: dict) -> None:
 
 
 def _write_mp4(path: str, data: np.ndarray, meta: dict) -> None:
+    import cv2
     arr = np.asarray(data)
     if arr.ndim != 4 or arr.shape[-1] not in (3, 4):
         raise ValueError("MP4 export expects TYXC RGB(A) data.")
@@ -221,3 +236,8 @@ def _write_image(path: str, data: Any, meta: dict) -> None:
 def write_single_image(path: str, data: Any, meta: dict) -> list[str]:
     _write_image(path, data, meta)
     return [path]
+
+
+def write_single_labels(path: str, data: Any, meta: dict) -> list[str]:
+    """napari's single-layer writer protocol does not pass the layer type."""
+    return write_single_image(path, data, {**meta, "layer_type": "labels"})

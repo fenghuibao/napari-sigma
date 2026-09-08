@@ -68,13 +68,23 @@ SIGMA preserves available physical-size and axis metadata. If physical size meta
 2. In the **Segmentation** tab, select **Open File** and load a fluorescence image. TIFF is recommended when axis metadata or calibrated pixel and voxel sizes are needed.
 3. Confirm the interpreted channel, time, and slice ranges. Supported image organizations include `YX`, `ZYX`, `TYX`, and `TZYX`. Spatial 3D images open in napari's 3D display mode by default, while 2D time series remain in 2D.
 4. Review the physical scale under **Image Info** and correct it before any analysis that reports calibrated measurements.
-5. Select a computational device: **CPU** works on all supported systems, **CUDA** uses a compatible NVIDIA GPU, and **MPS** uses Apple Silicon GPU acceleration.
+5. Select a computational device: **Auto** selects an available GPU when computation starts; **CPU**, **CUDA**, and **MPS** can also be requested explicitly. Unavailable devices fall back to CPU.
 6. Use **Segmentation** to extract local structural evidence and infer a binary foreground mask.
 7. Use **Morphology Analysis** to measure connected structures and their skeleton topology.
 8. For time series, use **Tracking** to associate objects across adjacent frames and classify linear, fission, fusion, or split-merge transitions.
 9. For aligned fluorescence channels, use **Proximity Analysis** to quantify spatial association between independently segmented structures.
 
 Each workflow operates on napari layers. Check the selected layer before running a command, especially when raw, processed, structural-response, and segmentation layers are open together. Results are returned as regular napari layers regardless of the selected computational device.
+
+Starting SIGMA does not reload or replace existing layers. Use **Open File** to load a file through SIGMA, or select the SIGMA reader in napari's normal opening flow. Plotting libraries and charts load when the Morphology Analysis tab is first opened; the first plot may need to build a font cache. Proximity runs in a background worker; clicking the computation action again requests cancellation.
+
+### Development checks
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+GUI tests require a display (on headless Linux, use `xvfb-run -a`). Release builds are gated on regression tests on macOS/Linux and Python 3.11/3.13. See [CHANGELOG.md](./CHANGELOG.md) for changes that affect measurements and saved data.
 
 ## Documentation
 

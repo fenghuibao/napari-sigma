@@ -7,6 +7,15 @@ from scipy import ndimage as ndi
 from skimage.draw import polygon
 
 from ._layer_candidates import is_binary_mask_data
+from ._geometry import exposed_face_measure
+from ._metadata import (
+    layer_dims_tag as _layer_dims_tag,
+    squeeze_leading_singletons as _squeeze_leading_singletons,
+)
+
+
+class ProximityCancelledError(InterruptedError):
+    """Raised at a cooperative boundary when proximity work is cancelled."""
 
 
 @dataclass(frozen=True)
@@ -200,19 +209,6 @@ class ProximityResult:
     surface_only: bool
 
 
-def _layer_dims_tag(layer) -> str:
-    md = getattr(layer, "metadata", {}) or {}
-    dims = md.get("dims") or md.get("dims_out") or ""
-    return str(dims).upper()
-
-
-def _squeeze_leading_singletons(arr: np.ndarray, target_ndim: int) -> np.ndarray:
-    out = np.asarray(arr)
-    while out.ndim > target_ndim and out.shape[0] == 1:
-        out = out[0]
-    return out
-
-
 def _normalized_layer_array(layer, *, allow_float: bool) -> np.ndarray:
     data = np.asarray(getattr(layer, "data", None))
     if data.size == 0:
@@ -229,7 +225,11 @@ def _normalized_layer_array(layer, *, allow_float: bool) -> np.ndarray:
         data = _squeeze_leading_singletons(data, 4)
     if data.ndim not in {2, 3, 4}:
         raise ValueError(f"Unsupported ndim for proximity analysis: {data.ndim}")
-    return np.asarray(data, dtype=float if allow_float else data.dtype)
+    if allow_float and data.dtype.kind not in "buif":
+        raise ValueError("Raw image data must be numeric.")
+    # Raw intensities need no full-volume float64 conversion; reductions below
+    # choose their accumulator dtype explicitly.
+    return data
 
 
 def _binary_from_layer(layer) -> np.ndarray:
@@ -416,17 +416,18 @@ def _compute_target_proximity_rows_for_source_objects(
     target_proximity = np.logical_and(target_basis, np.asarray(target_distance_to_source, dtype=float) <= float(distance_threshold))
 
     object_ids = [int(v) for v in np.unique(source_labels[np.asarray(roi_mask, dtype=bool)]) if int(v) > 0]
-    object_records: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+    object_records: list[tuple[int, int]] = []
     for object_id in object_ids:
         source_object = np.logical_and(source_labels == int(object_id), roi_mask)
         source_size = int(source_object.sum())
         if source_size <= 0:
             continue
-        target_near_object = np.logical_and(target_proximity, np.asarray(nearest_source_labels, dtype=np.int32) == int(object_id))
-        object_records.append((source_size, object_id, source_object, target_near_object))
+        object_records.append((source_size, object_id))
 
     object_records.sort(key=lambda item: (-int(item[0]), int(item[1])))
-    for source_size, object_id, source_object, target_near_object in object_records:
+    for source_size, object_id in object_records:
+        source_object = np.logical_and(source_labels == object_id, roi_mask)
+        target_near_object = np.logical_and(target_proximity, nearest_source_labels == object_id)
         global_id = next_global_id
         next_global_id += 1
         labels_out[target_near_object] = global_id
@@ -591,60 +592,13 @@ def _surface_mask(mask: np.ndarray, voxel_size: tuple[float, ...]) -> np.ndarray
 
 def _surface_measure_for_selection(object_mask: np.ndarray, selection_mask: np.ndarray, voxel_size: tuple[float, ...]) -> float:
     object_mask = np.asarray(object_mask, dtype=bool)
-    selection_mask = np.logical_and(np.asarray(selection_mask, dtype=bool), object_mask)
+    selection_mask = np.asarray(selection_mask, dtype=bool)
     if object_mask.shape != selection_mask.shape:
-        raise ValueError(
-            f"Surface selection shape must match object mask shape, got {selection_mask.shape} and {object_mask.shape}."
-        )
-
-    def _measure_one(frame_object: np.ndarray, frame_selection: np.ndarray, sampling: tuple[float, ...]) -> float:
-        frame_object = np.asarray(frame_object, dtype=bool)
-        frame_selection = np.logical_and(np.asarray(frame_selection, dtype=bool), frame_object)
-        if not np.any(frame_selection):
-            return 0.0
-        total = 0.0
-        ndim = int(frame_object.ndim)
-        for axis in range(ndim):
-            face_measure = 1.0
-            for spacing_axis, spacing in enumerate(sampling):
-                if int(spacing_axis) != int(axis):
-                    face_measure *= float(spacing)
-
-            exposed_before = frame_selection.copy()
-            before_current = [slice(None)] * ndim
-            before_neighbor = [slice(None)] * ndim
-            before_current[axis] = slice(1, None)
-            before_neighbor[axis] = slice(None, -1)
-            exposed_before[tuple(before_current)] &= ~frame_object[tuple(before_neighbor)]
-
-            exposed_after = frame_selection.copy()
-            after_current = [slice(None)] * ndim
-            after_neighbor = [slice(None)] * ndim
-            after_current[axis] = slice(None, -1)
-            after_neighbor[axis] = slice(1, None)
-            exposed_after[tuple(after_current)] &= ~frame_object[tuple(after_neighbor)]
-
-            total += float(exposed_before.sum() + exposed_after.sum()) * float(face_measure)
-        return float(total)
-
-    if object_mask.ndim == 4:
-        sampling = tuple(float(v) for v in voxel_size[-3:])
-        return float(
-            sum(
-                _measure_one(object_mask[frame], selection_mask[frame], sampling)
-                for frame in range(int(object_mask.shape[0]))
-            )
-        )
-    if object_mask.ndim == 3 and len(voxel_size) == 2:  # TYX
-        sampling = tuple(float(v) for v in voxel_size[-2:])
-        return float(
-            sum(
-                _measure_one(object_mask[frame], selection_mask[frame], sampling)
-                for frame in range(int(object_mask.shape[0]))
-            )
-        )
-    sampling = _spatial_sampling_for_shape(object_mask.shape, voxel_size)
-    return float(_measure_one(object_mask, selection_mask, sampling))
+        raise ValueError("Surface selection must match object mask shape.")
+    if object_mask.ndim == 4 or (object_mask.ndim == 3 and len(voxel_size) == 2):
+        return float(sum(exposed_face_measure(frame, voxel_size, selection_mask[index])
+                         for index, frame in enumerate(object_mask)))
+    return exposed_face_measure(object_mask, voxel_size, selection_mask)
 
 
 def _selection_physical_measure(
@@ -683,7 +637,13 @@ def compute_proximity_result(
     distance_unit: str | None = None,
     distance_threshold: float = 0.2,
     surface_only: bool = True,
+    cancel_check=None,
 ) -> ProximityResult:
+    def check_cancelled():
+        if cancel_check is not None and cancel_check():
+            raise ProximityCancelledError("Proximity analysis cancelled.")
+
+    check_cancelled()
     source_mask_all = _binary_from_layer(source_seg_layer)
     target_mask_all = _binary_from_layer(target_seg_layer)
     source_raw_all = _raw_from_layer(source_raw_layer)
@@ -722,11 +682,14 @@ def compute_proximity_result(
     distance_unit = str(distance_unit or unit)
     threshold = max(0.0, float(distance_threshold))
     source_distance_to_target = _distance_to_mask(target_mask_all, distance_voxel_size)
+    check_cancelled()
     target_distance_to_source = _distance_to_mask(source_mask_all, distance_voxel_size)
+    check_cancelled()
     source_basis_all = _surface_mask(source_mask_all, voxel_size) if surface_only else source_mask_all
     target_basis_all = _surface_mask(target_mask_all, voxel_size) if surface_only else target_mask_all
     source_labels_all = _instance_labels_from_layer(source_seg_layer, source_mask_all, voxel_size)
     nearest_source_labels_all = _nearest_labels_to_mask(source_labels_all, distance_voxel_size)
+    check_cancelled()
     combined_source_mask = np.zeros_like(source_mask_all, dtype=bool)
     combined_target_mask = np.zeros_like(target_mask_all, dtype=bool)
     combined_overlap_mask = np.zeros_like(source_mask_all, dtype=bool)
@@ -739,6 +702,7 @@ def compute_proximity_result(
     next_global_id = 1
 
     for spec in roi_specs:
+        check_cancelled()
         roi_mask = np.asarray(spec.mask, dtype=bool)
         if roi_mask.shape != source_mask_all.shape:
             raise ValueError(
@@ -789,8 +753,8 @@ def compute_proximity_result(
             float(target_proximity_size / target_basis_size) if target_basis_size > 0 else 0.0
         )
 
-        source_raw = np.where(roi_mask, source_raw_all, 0.0)
-        target_raw = np.where(roi_mask, target_raw_all, 0.0)
+        source_raw = np.where(roi_mask, source_raw_all, 0)
+        target_raw = np.where(roi_mask, target_raw_all, 0)
         manders_m1 = _manders(source_raw, source_mask, overlap_mask)
         manders_m2 = _manders(target_raw, target_mask, overlap_mask)
         proximity_manders_m1 = _manders(source_raw, source_basis, source_proximity_mask)

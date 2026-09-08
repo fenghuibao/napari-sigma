@@ -366,8 +366,9 @@ class FrangiFilter(nn.Module):
         # The analytic eigensolver has many per-voxel intermediates. Running it
         # over the whole volume at once multiplies peak memory without changing
         # the independent voxel calculations, so bound its working set.
-        response = torch.empty_like(image)
-        response_flat = response.reshape(-1)
+        # The flattened destination must share storage even for transposed input.
+        response = torch.empty_like(image, memory_format=torch.contiguous_format)
+        response_flat = response.view(-1)
         hessian_flat = tuple(element.reshape(-1) for element in hessian_elems)
         for start in range(0, response_flat.numel(), _FRANGI_RESPONSE_CHUNK_VOXELS):
             stop = min(start + _FRANGI_RESPONSE_CHUNK_VOXELS, response_flat.numel())

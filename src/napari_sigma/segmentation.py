@@ -288,7 +288,7 @@ def _pairwise_potential(
 
     # For binary labels, the original class-1 indicator is exactly the
     # negative of the class-0 indicator. Only one pairwise volume is needed.
-    output[1].copy_(pairwise_class0[0]).neg_().add_(frangi_pot1[0])
+    output[1].copy_(-pairwise_class0[0] + frangi_pot1[0])
     output[0].add_(frangi_pot0[0])
     return output
 
@@ -811,14 +811,18 @@ def segmentation(
         If positive and `em_sample_points` is not positive, sample at most this
         many background points for GMM initialization and EM updates.
     """
-    image = np.asarray(image)
-    frangi = np.asarray(frangi)
+    image = np.asarray(image, dtype=np.float32)
+    frangi = np.asarray(frangi, dtype=np.float32)
     if image.shape != frangi.shape:
         raise ValueError(
             f"image and frangi must have the same shape, got {image.shape} and {frangi.shape}."
         )
     if image.ndim not in {2, 3}:
         raise ValueError(f"segmentation expects a 2D or 3D image, got ndim={image.ndim}.")
+    if image.size == 0 or not np.isfinite(image).all() or not np.isfinite(frangi).all():
+        raise ValueError("image and frangi must be nonempty and contain only finite values.")
+    if np.min(image) == np.max(image):
+        raise ValueError("A constant image cannot initialize foreground/background GMMs.")
     if int(n_fore) < 1 or int(n_back) < 1:
         raise ValueError("n_fore and n_back must both be at least 1.")
     if int(max_iter) < 1:
@@ -931,12 +935,14 @@ def segmentation(
             if n_bg_count < 1 or n_fg_count < 1:
                 # Keep mask shape compatible with `label` (with the channel dim).
                 mask = data > data.median()
-                label[mask] = 1
+                label.copy_(mask.to(dtype=label.dtype))
                 label_flat = label.reshape(-1)
                 mask_bg_flat = label_flat == 0
                 mask_fg_flat = label_flat == 1
                 class_counts = torch.stack((mask_fg_flat.sum(), mask_bg_flat.sum())).detach().cpu()
                 n_fg_count, n_bg_count = (int(value) for value in class_counts.tolist())
+                if n_bg_count < 1 or n_fg_count < 1:
+                    raise ValueError("Cannot separate foreground and background from this image.")
 
             if it == 0 and not warm_started:
                 init_fg, init_bg = _sample_gmm_training_data_from_masks(
@@ -1047,67 +1053,23 @@ def segmentation(
                     n_back,
                 )
 
-            if data.ndim == 3:
-                _pairwise_potential(
-                    label,
-                    float(beta1),
-                    0.1,
-                    fpot0,
-                    fpot1,
-                    dev,
-                    pixel_size_xy,
-                    output=U_c,
-                )
+            _pairwise_potential(
+                label,
+                float(beta1),
+                0.1,
+                fpot0,
+                fpot1,
+                dev,
+                pixel_size_xy,
+                pixel_size_z,
+                output=U_c,
+            )
+            for cls, count in ((0, n_back), (1, n_fore)):
                 _fill_gmm_class_likelihood(
-                    U_g[0],
-                    data,
-                    pi[:n_back, 0],
-                    mu[:n_back, 0],
-                    sigma[:n_back, 0],
-                    U_c[0],
-                    log_output=True,
+                    U_g[cls], data, pi[:count, cls], mu[:count, cls],
+                    sigma[:count, cls], U_c[cls], log_output=True,
                 )
-                _fill_gmm_class_likelihood(
-                    U_g[1],
-                    data,
-                    pi[:n_fore, 1],
-                    mu[:n_fore, 1],
-                    sigma[:n_fore, 1],
-                    U_c[1],
-                    log_output=True,
-                )
-                label = _binary_label_from_likelihood(U_g, (C, H, W))
-            else:
-                _pairwise_potential(
-                    label,
-                    float(beta1),
-                    0.1,
-                    fpot0,
-                    fpot1,
-                    dev,
-                    pixel_size_xy,
-                    pixel_size_z,
-                    output=U_c,
-                )
-                _fill_gmm_class_likelihood(
-                    U_g[0],
-                    data,
-                    pi[:n_back, 0],
-                    mu[:n_back, 0],
-                    sigma[:n_back, 0],
-                    U_c[0],
-                    log_output=True,
-                )
-                _fill_gmm_class_likelihood(
-                    U_g[1],
-                    data,
-                    pi[:n_fore, 1],
-                    mu[:n_fore, 1],
-                    sigma[:n_fore, 1],
-                    U_c[1],
-                    log_output=True,
-                )
-                label = _binary_label_from_likelihood(U_g, (C, D, H, W))
+            label = _binary_label_from_likelihood(U_g, tuple(data.shape))
 
             loglh_new_outer = _outer_log_likelihood_monitor(
                 label,

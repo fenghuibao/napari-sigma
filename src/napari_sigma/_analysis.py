@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import os
-import tempfile
 from contextlib import suppress
 from typing import Any
 
@@ -32,13 +31,13 @@ from qtpy.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from scipy import ndimage as ndi
 from skimage.graph import MCP
 from skimage.measure import (
+    find_contours,
     label,
     perimeter,
     regionprops,
@@ -47,23 +46,12 @@ from skimage.morphology import skeletonize
 
 from ._layer_candidates import limited_unique_values
 from ._tracking import _label_frame
-
-_MPL_CONFIG_DIR = os.path.join(tempfile.gettempdir(), "napari-sigma-matplotlib")
-with suppress(OSError):
-    os.makedirs(_MPL_CONFIG_DIR, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", _MPL_CONFIG_DIR)
-
-try:
-    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-    from matplotlib.figure import Figure
-except (ImportError, RuntimeError, OSError):  # pragma: no cover
-    Figure = None
-    FigureCanvasQTAgg = None
-
-try:
-    from openpyxl import Workbook
-except (ImportError, OSError):  # pragma: no cover
-    Workbook = None
+from ._geometry import exposed_face_measure
+from ._metadata import (
+    layer_dims_tag as _layer_dims_tag,
+    squeeze_leading_singletons as _squeeze_leading_singletons,
+    unit_from_metadata,
+)
 
 
 class AnalysisCancelledError(Exception):
@@ -72,7 +60,7 @@ class AnalysisCancelledError(Exception):
 
 def _get_units_from_layer(layer) -> str:
     md = getattr(layer, "metadata", {}) or {}
-    return md.get("PhysicalSizeXUnit") or md.get("unit") or md.get("Units") or "um"
+    return unit_from_metadata(md)
 
 
 def _get_group_id(layer) -> str | None:
@@ -83,11 +71,6 @@ def _get_group_id(layer) -> str | None:
     return None
 
 
-def _layer_dims_tag(layer) -> str:
-    md = getattr(layer, "metadata", {}) or {}
-    return str(md.get("dims_out") or md.get("dims") or "").upper()
-
-
 def _is_analysis_aux_layer(layer) -> bool:
     md = getattr(layer, "metadata", {}) or {}
     return bool(
@@ -95,13 +78,6 @@ def _is_analysis_aux_layer(layer) -> bool:
         or md.get("is_analysis_highlight")
         or md.get("is_analysis_topology")
     )
-
-
-def _squeeze_leading_singletons(arr: np.ndarray, target_ndim: int) -> np.ndarray:
-    out = np.asarray(arr)
-    while out.ndim > target_ndim and out.shape[0] == 1:
-        out = out[0]
-    return out
 
 
 def _component_mask_from_layer(layer, frame_index: int | None = None) -> np.ndarray:
@@ -258,8 +234,10 @@ def write_analysis_export_file(
             writer.writerows(rows)
         return
     if suffix == ".xlsx":
-        if Workbook is None:
-            raise RuntimeError("openpyxl is not available in this environment.")
+        try:
+            from openpyxl import Workbook
+        except (ImportError, OSError) as exc:
+            raise RuntimeError("openpyxl is not available in this environment.") from exc
         wb = Workbook()
         ws = wb.active
         ws.title = str(sheet_title)[:31] or "measurements"
@@ -1476,57 +1454,39 @@ def _skeleton_topology_details(
 
 
 def _major_axis_length_in_units(prop, pixel_size: tuple[float, ...]) -> float:
-    axis_major_length = getattr(prop, "axis_major_length", 0.0) or 0.0
-    if axis_major_length <= 0:
-        return 0.0
-    spatial_scale = float(np.mean(pixel_size)) if pixel_size else 1.0
-    return float(axis_major_length * spatial_scale)
+    """Compute the principal axis after scaling coordinates, not its scalar length."""
+    mask = np.asarray(prop.image, dtype=np.uint8)
+    spacing = tuple(pixel_size[-mask.ndim:]) if pixel_size else (1.0,) * mask.ndim
+    properties = regionprops(mask, spacing=spacing)
+    return float(properties[0].axis_major_length) if properties else 0.0
 
 
 def _perimeter_in_units(mask: np.ndarray, pixel_size: tuple[float, ...]) -> float:
-    """Estimate 2D perimeter from the binary boundary and convert to physical units."""
+    """Estimate boundary length in physical coordinates.
+
+    Preserve the historical estimator for square pixels. For unequal spacings,
+    measure interpolated contours in calibrated coordinates instead of applying
+    an orientation-independent average scale.
+    """
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2 or not np.any(binary):
         return 0.0
-    spatial_scale = float(np.mean(tuple(float(v) for v in pixel_size[-2:]))) if pixel_size else 1.0
-    return float(perimeter(binary, neighborhood=8) * spatial_scale)
+    spacing = np.asarray(pixel_size[-2:] if pixel_size else (1.0, 1.0), dtype=float)
+    if spacing.shape != (2,) or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError("Pixel spacing must be finite and positive.")
+    if np.isclose(spacing[0], spacing[1], rtol=1e-12, atol=0):
+        return float(perimeter(binary, neighborhood=8) * spacing[0])
+    contours = find_contours(np.pad(binary, 1).astype(float), 0.5, fully_connected="high")
+    return float(sum(np.linalg.norm(np.diff(contour, axis=0) * spacing, axis=1).sum()
+                     for contour in contours))
 
 
 def _surface_area_in_units(mask: np.ndarray, pixel_size: tuple[float, ...]) -> float:
-    """Estimate 3D surface area from exposed voxel faces in physical units.
-
-    This keeps the measurement aligned with the discrete voxel segmentation,
-    rather than fitting a smoothed mesh as marching-cubes would.
-    """
+    """Measure exposed voxel faces in physical units."""
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 3 or not np.any(binary):
         return 0.0
-    vz, vy, vx = (float(v) for v in pixel_size[-3:])
-    volume = binary.astype(np.uint8)
-
-    left = np.pad(volume, ((0, 0), (0, 0), (1, 0)), mode="constant")[:, :, :-1]
-    right = np.pad(volume, ((0, 0), (0, 0), (0, 1)), mode="constant")[:, :, 1:]
-    front = np.pad(volume, ((0, 0), (1, 0), (0, 0)), mode="constant")[:, :-1, :]
-    back = np.pad(volume, ((0, 0), (0, 1), (0, 0)), mode="constant")[:, 1:, :]
-    up = np.pad(volume, ((1, 0), (0, 0), (0, 0)), mode="constant")[:-1, :, :]
-    down = np.pad(volume, ((0, 1), (0, 0), (0, 0)), mode="constant")[1:, :, :]
-
-    left_surface = np.clip(volume - left, 0, 1) * (vy * vz)
-    right_surface = np.clip(volume - right, 0, 1) * (vy * vz)
-    front_surface = np.clip(volume - front, 0, 1) * (vx * vz)
-    back_surface = np.clip(volume - back, 0, 1) * (vx * vz)
-    up_surface = np.clip(volume - up, 0, 1) * (vx * vy)
-    down_surface = np.clip(volume - down, 0, 1) * (vx * vy)
-
-    surface = (
-        left_surface
-        + right_surface
-        + front_surface
-        + back_surface
-        + up_surface
-        + down_surface
-    )
-    return float(np.sum(surface, dtype=np.float64))
+    return exposed_face_measure(binary, pixel_size[-3:])
 
 
 def _circle_polygon(center: tuple[float, float], radius: float, num_vertices: int = 24) -> np.ndarray:
@@ -1546,6 +1506,37 @@ def _triangle_polygon(center: tuple[float, float], radius: float) -> np.ndarray:
 
 
 class SegmentAnalysisMixin:
+    def _ensure_analysis_plot(self) -> bool:
+        if self._analysis_plot_axes is not None:
+            return True
+        try:
+            # Do not change MPLCONFIGDIR: respect the user's persistent cache.
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib.figure import Figure
+        except (ImportError, RuntimeError, OSError) as exc:
+            self._analysis_plot_placeholder.setText(f"Plots unavailable: {exc}")
+            return False
+        bg, _fg, _grid, _bar = self._analysis_plot_palette()
+        self._analysis_plot_figure = Figure(figsize=(4.6, 8.2), facecolor=bg)
+        self._analysis_plot_axes = self._analysis_plot_figure.subplots(
+            3, 1, gridspec_kw={"height_ratios": [1, 1, 1.8]},
+        )
+        canvas = FigureCanvasQTAgg(self._analysis_plot_figure)
+        canvas.setMinimumHeight(self._scaled_px(640))
+        self._analysis_plot_canvas = canvas
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(canvas)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(self._scaled_px(300))
+        self._analysis_plot_scroll = scroll
+        canvas.installEventFilter(self)
+        scroll.viewport().installEventFilter(self)
+        self._analysis_plot_placeholder.hide()
+        self._analysis_plot_layout.addWidget(scroll)
+        self._apply_analysis_plot_theme()
+        return True
+
     def _analysis_current_frame_index(self, layer) -> int | None:
         dims_tag = _layer_dims_tag(layer)
         if dims_tag not in {"TYX", "TZYX"}:
@@ -1617,32 +1608,10 @@ class SegmentAnalysisMixin:
         plot_box = QGroupBox("Distribution Plots")
         plot_layout = QVBoxLayout(plot_box)
         plot_layout.setContentsMargins(2, 4, 2, 4)
-        if Figure is not None and FigureCanvasQTAgg is not None:
-            bg, _fg, _grid, _bar = self._analysis_plot_palette()
-            self._analysis_plot_figure = Figure(figsize=(4.6, 8.2), facecolor=bg)
-            self._analysis_plot_axes = self._analysis_plot_figure.subplots(3, 1, gridspec_kw={"height_ratios": [1, 1, 1.8]})
-            self._analysis_plot_canvas = FigureCanvasQTAgg(self._analysis_plot_figure)
-            with suppress(AttributeError):
-                self._analysis_plot_canvas.setMinimumHeight(self._scaled_px(640))
-            self._apply_analysis_plot_theme()
-            plot_scroll = QScrollArea()
-            plot_scroll.setWidgetResizable(True)
-            plot_scroll.setWidget(self._analysis_plot_canvas)
-            self._analysis_plot_scroll = plot_scroll
-            self._analysis_plot_canvas.installEventFilter(self)
-            plot_scroll.viewport().installEventFilter(self)
-            with suppress(AttributeError):
-                plot_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-            with suppress(AttributeError):
-                plot_scroll.setFixedHeight(self._scaled_px(300))
-            plot_layout.addWidget(plot_scroll)
-            self._plot_distributions(None)
-        else:
-            plot_fallback = QTextEdit()
-            plot_fallback.setReadOnly(True)
-            plot_fallback.setPlainText("Matplotlib is unavailable in this environment, so the distribution plots cannot be shown.")
-            self._analysis_plot_canvas = plot_fallback
-            plot_layout.addWidget(plot_fallback)
+        self._analysis_plot_layout = plot_layout
+        self._analysis_pending_plot_info = None
+        self._analysis_plot_placeholder = QLabel("Plots load when Morphology Analysis is opened.")
+        plot_layout.addWidget(self._analysis_plot_placeholder)
         with suppress(AttributeError):
             plot_box.setMinimumHeight(self._scaled_px(320))
         with suppress(AttributeError):
@@ -1998,7 +1967,7 @@ class SegmentAnalysisMixin:
         try:
             write_analysis_export_file(path, headers, rows)
         except RuntimeError as e:
-            if suffix == ".xlsx" and Workbook is None:
+            if suffix == ".xlsx" and "openpyxl" in str(e):
                 QMessageBox.warning(self, "XLSX unavailable", "openpyxl is not available in this environment. Please export as CSV/TXT or install openpyxl.")
                 return
             QMessageBox.critical(self, "Export failed", f"Failed to export table: {e!r}")
@@ -2255,6 +2224,7 @@ class SegmentAnalysisMixin:
                 color=fg, fontsize=9, verticalalignment="top")
 
     def _plot_distributions(self, plot_info: dict[str, Any] | None) -> None:
+        self._analysis_pending_plot_info = plot_info
         if self._analysis_plot_axes is None or self._analysis_plot_canvas is None:
             return
         axes = np.atleast_1d(self._analysis_plot_axes)

@@ -23,6 +23,9 @@ _CLX_STRING = 8
 _CLX_BYTEARRAY = 9
 _CLX_LEVEL = 11
 _CLX_COMPRESSED = 76
+_MAX_METADATA_BYTES = 64 * 1024 * 1024
+_MAX_METADATA_ITEMS = 100_000
+_MAX_STRING_BYTES = 4 * 1024 * 1024
 
 
 class _InvalidNisMetadata(ValueError):
@@ -30,6 +33,8 @@ class _InvalidNisMetadata(ValueError):
 
 
 def _read_exact(stream: BytesIO, size: int) -> bytes:
+    if size < 0 or size > _MAX_METADATA_BYTES:
+        raise _InvalidNisMetadata("NIS metadata size exceeds the safety limit")
     value = stream.read(size)
     if len(value) != size:
         raise _InvalidNisMetadata("truncated NIS-Elements metadata")
@@ -48,6 +53,8 @@ def _read_clx_string(stream: BytesIO) -> str:
         if pair == b"\x00\x00":
             break
         chunks.extend(pair)
+        if len(chunks) > _MAX_STRING_BYTES:
+            raise _InvalidNisMetadata("NIS metadata string is too long")
     return bytes(chunks).decode("utf-16le", errors="replace")
 
 
@@ -93,9 +100,15 @@ def _decode_clx_items(
     count: int = 1,
     *,
     depth: int = 0,
+    _budget: list[int] | None = None,
 ) -> dict[str, Any]:
     if depth > 64:
         raise _InvalidNisMetadata("NIS metadata nesting is too deep")
+    if _budget is None:
+        _budget = [_MAX_METADATA_BYTES, _MAX_METADATA_ITEMS]
+    if count < 0 or count > _budget[1]:
+        raise _InvalidNisMetadata("NIS metadata has too many items")
+    _budget[1] -= count
     output: dict[str, Any] = {}
     for _ in range(count):
         item_start = stream.tell()
@@ -105,19 +118,31 @@ def _decode_clx_items(
         if data_type == _CLX_COMPRESSED:
             _read_exact(stream, 10)
             try:
-                inflated = zlib.decompress(stream.read())
+                compressed = stream.read(_MAX_METADATA_BYTES + 1)
+                if len(compressed) > _MAX_METADATA_BYTES:
+                    raise _InvalidNisMetadata("Compressed NIS metadata is too large")
+                decoder = zlib.decompressobj()
+                inflated = decoder.decompress(compressed, _budget[0] + 1)
+                if len(inflated) > _budget[0] or decoder.unconsumed_tail:
+                    raise _InvalidNisMetadata("NIS metadata decompression limit exceeded")
+                if not decoder.eof:
+                    raise _InvalidNisMetadata("truncated compressed NIS metadata")
+                _budget[0] -= len(inflated)
             except zlib.error as error:
                 raise _InvalidNisMetadata("invalid compressed NIS metadata") from error
-            return _decode_clx_items(BytesIO(inflated), depth=depth + 1)
+            return _decode_clx_items(BytesIO(inflated), depth=depth + 1, _budget=_budget)
         if data_type == _CLX_LEVEL:
             item_count, item_length = _read_struct(stream, "<IQ")
             consumed = stream.tell() - item_start
             child_length = int(item_length) - consumed
             if child_length < 0:
                 raise _InvalidNisMetadata("invalid NIS metadata level length")
+            if child_length > _budget[0]:
+                raise _InvalidNisMetadata("NIS metadata expansion limit exceeded")
+            _budget[0] -= child_length
             child_data = _read_exact(stream, child_length)
             value: Any = _decode_clx_items(
-                BytesIO(child_data), int(item_count), depth=depth + 1
+                BytesIO(child_data), int(item_count), depth=depth + 1, _budget=_budget
             )
             _read_exact(stream, int(item_count) * 8)
         else:
