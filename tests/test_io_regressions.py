@@ -18,6 +18,29 @@ from napari_sigma._writer import write_single_image, write_single_labels
 
 
 class IORegressions(unittest.TestCase):
+    def test_mp4_export_with_headless_opencv(self):
+        import cv2
+        frames = np.zeros((3, 16, 20, 3), dtype=np.uint8)
+        frames[..., 0] = 180
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "movie.mp4")
+            write_single_image(path, frames, {"metadata": {"fps": 5}})
+            capture = cv2.VideoCapture(path)
+            try:
+                self.assertTrue(capture.isOpened())
+                count = 0
+                while True:
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    self.assertEqual(frame.shape, (16, 20, 3))
+                    self.assertGreater(float(frame[..., 2].mean()), 160)
+                    self.assertLess(float(frame[..., :2].mean()), 15)
+                    count += 1
+                self.assertEqual(count, len(frames))
+            finally:
+                capture.release()
+
     def test_label_writer_protocol_and_large_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "labels.tif")

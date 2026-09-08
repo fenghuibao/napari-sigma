@@ -13,7 +13,6 @@ from types import MethodType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-import cv2
 import dask.array as da
 import numpy as np
 from napari.layers import Labels as NapariLabels
@@ -316,6 +315,8 @@ def _upsample_xy_bilinear(
     progress=None,
     cancel_check=None,
 ) -> np.ndarray:
+    import cv2
+
     shape = tuple(int(value) for value in getattr(image, "shape", ()))
     factor = int(factor)
     if len(shape) < 2 or factor < 2:

@@ -16,6 +16,7 @@
 ### Startup, lifecycle and safety
 
 - Load Matplotlib/charts on first analysis-tab use, openpyxl on export, and Torch when a computation requests a device. Respect the user's Matplotlib cache configuration.
+- Use headless OpenCV for image/video operations and import it only when needed, avoiding its bundled Qt plugins conflicting with napari/PyQt6 on Linux. Existing environments should keep only one OpenCV package; see the upgrade instructions.
 - Run Proximity in a cancellable background worker; avoid full-volume raw float64 copies and retaining per-object full-volume masks simultaneously.
 - Release viewer callbacks, scale subscriptions and context-menu patches when the panel is removed/closed; make cleanup idempotent.
 - Bound NIS metadata expansion, nesting, string sizes and item counts.

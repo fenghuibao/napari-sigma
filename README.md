@@ -39,6 +39,15 @@ napari-sigma
 
 PyQt5 does not normally need to be uninstalled: the launcher selects PyQt6 and its matching plugins before napari starts. It configures Qt only inside its own process and does not modify global environment variables. A fresh environment remains the safest recovery path for an environment with unrelated binary-level Qt conflicts. The standard `napari` command remains available when another backend is preferred.
 
+Starting with 0.0.4, SIGMA uses `opencv-python-headless`: image resizing and video export remain available, while napari supplies the GUI. Do not install multiple OpenCV variants together because they share the `cv2` namespace. When upgrading a dedicated SIGMA environment from an older release, remove the old OpenCV variants before reinstalling:
+
+```bash
+python -m pip uninstall opencv-python opencv-contrib-python opencv-contrib-python-headless opencv-python-headless
+python -m pip install --upgrade "napari-sigma[all]"
+```
+
+If other applications in the same environment need OpenCV's own GUI, use a separate environment for SIGMA instead.
+
 ### Development installation
 
 From the repository root:

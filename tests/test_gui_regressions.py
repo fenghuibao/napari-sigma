@@ -86,6 +86,7 @@ QApplication.processEvents()
 assert 'matplotlib' not in sys.modules, 'Matplotlib eagerly imported'
 assert 'openpyxl' not in sys.modules, 'openpyxl eagerly imported'
 assert 'torch' not in sys.modules, 'Torch eagerly imported'
+assert 'cv2' not in sys.modules, 'OpenCV eagerly imported'
 assert w._analysis_plot_axes is None
 w._panel_tabs.setCurrentWidget(w._analysis_tab)
 QApplication.processEvents()
@@ -99,6 +100,17 @@ v.close()
             result = subprocess.run([sys.executable, "-c", code], env=env,
                                     capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_upsampling_preserves_qt_environment(self):
+        from napari_sigma._widget import _upsample_xy_bilinear
+        keys = ("QT_QPA_PLATFORM_PLUGIN_PATH", "QT_QPA_FONTDIR", "QT_PLUGIN_PATH")
+        before = {key: os.environ.get(key) for key in keys}
+        frame = np.array([[0, 4], [8, 12]], dtype=np.float32)
+        actual = _upsample_xy_bilinear(np.stack([frame, frame + 20]), 2)
+        expected = np.array([[0, 1, 3, 4], [2, 3, 5, 6],
+                             [6, 7, 9, 10], [8, 9, 11, 12]], dtype=np.float32)
+        np.testing.assert_array_equal(actual, np.stack([expected, expected + 20]))
+        self.assertEqual(before, {key: os.environ.get(key) for key in keys})
 
     def test_labels_use_same_shape_in_reader_and_widget(self):
         from napari_sigma._reader import tczyx_to_layer_data
