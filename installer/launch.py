@@ -99,12 +99,16 @@ def main(argv=None) -> int:
         if icon.isNull():
             raise RuntimeError("The SIGMA app icon is missing or invalid")
         app.setWindowIcon(icon)
-        pixmap = QPixmap(420, 440)
+        pixel_ratio = app.primaryScreen().devicePixelRatio()
+        pixmap = QPixmap(round(420 * pixel_ratio), round(440 * pixel_ratio))
+        pixmap.setDevicePixelRatio(pixel_ratio)
         pixmap.fill(QColor("white"))
         logo = QPixmap(str(RESOURCES / "sigma.png")).scaled(
-            380, 380, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            round(380 * pixel_ratio), round(380 * pixel_ratio),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        logo.setDevicePixelRatio(pixel_ratio)
         painter = QPainter(pixmap)
-        painter.drawPixmap((pixmap.width() - logo.width()) // 2, 10, logo)
+        painter.drawPixmap(20, 10, logo)
         painter.end()
         splash = QSplashScreen(pixmap)
         splash.setWindowTitle("SIGMA")
