@@ -1,0 +1,21 @@
+SIGMA Desktop - unsigned test distribution
+
+SIGMA is copyright its contributors and distributed under the MIT license.
+The complete SIGMA license is included as SIGMA-LICENSE.txt in sigma-desktop.
+Source code: https://github.com/fenghuibao/napari-sigma
+
+This installer includes a private Python runtime and third-party open-source
+software, including napari, PyTorch, Qt/PyQt6, NumPy, SciPy and other libraries.
+Each dependency remains subject to its own license; upstream license and
+copyright files are retained in the bundled packages and wheel archives.
+See bundle.json and requirements.lock for the exact package versions and hashes.
+
+This test installer is not Developer ID notarized or Windows Authenticode signed.
+Only install artifacts from a trusted source after verifying their checksums.
+Do not disable operating-system security software to install SIGMA. If your
+organization blocks unsigned software, contact its IT administrator or wait
+for a signed distribution.
+
+No administrator Python, PATH, or shell configuration is changed. No user
+microscopy data is included. Installation uses only bundled wheels and does
+not require a network connection. No automatic updates are performed.

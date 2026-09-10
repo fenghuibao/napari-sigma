@@ -1,0 +1,84 @@
+name: Desktop installers (unsigned)
+
+on:
+  push:
+    branches: [build/desktop-installers]
+    paths: ["installer/**", ".github/workflows/desktop_installers.yml", "tests/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: osx-arm64
+          - os: macos-15-intel
+            target: osx-64
+          - os: windows-2022
+            target: win-64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: sigma-builder
+          python-version: "3.13"
+          channels: conda-forge
+          conda-remove-defaults: true
+      - name: Install isolated build tools
+        run: conda install --override-channels -c conda-forge constructor=3.16.1 conda-standalone menuinst=2.5.2 pillow pyyaml --yes --quiet
+      - name: Packaging unit tests
+        run: python -m unittest discover -s installer/tests -v
+      - name: Build offline installer
+        run: python installer/build.py --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
+      - name: Install macOS package in disposable runner
+        if: runner.os == 'macOS'
+        run: sudo installer -pkg dist-desktop/*.pkg -target /
+      - name: Verify installed macOS application and core regressions
+        if: runner.os == 'macOS'
+        run: python installer/verify.py --prefix /Library/sigma-0.0.5 --output-dir dist-desktop/verification
+      - name: Install Windows package (path with spaces)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = (Get-ChildItem dist-desktop/*.exe).FullName
+          $prefix = "$env:LOCALAPPDATA\SIGMA Desktop Test\0.0.5"
+          $proc = Start-Process -FilePath $package -ArgumentList "/S /InstallationType=JustMe /AddToPath=0 /RegisterPython=0 /D=$prefix" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Installer failed with exit code $($proc.ExitCode)" }
+          "SIGMA_TEST_PREFIX=$prefix" >> $env:GITHUB_ENV
+      - name: Verify installed Windows application and core regressions
+        if: runner.os == 'Windows'
+        run: python installer/verify.py --prefix "$SIGMA_TEST_PREFIX" --output-dir dist-desktop/verification
+      - name: Test Windows uninstaller
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $uninstaller = (Get-ChildItem "$env:SIGMA_TEST_PREFIX\Uninstall*.exe").FullName
+          if (!$uninstaller) { throw "Uninstaller was not created" }
+          $proc = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Uninstaller failed" }
+          $record = Get-Content dist-desktop/verification/verification.json | ConvertFrom-Json
+          foreach ($shortcut in $record.shortcuts.paths) {
+            if (Test-Path $shortcut) { throw "Shortcut remains after uninstall: $shortcut" }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: SIGMA-0.0.5-${{ matrix.target }}-unsigned
+          path: dist-desktop/
+          compression-level: 0
+          retention-days: 30
