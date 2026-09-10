@@ -8,8 +8,20 @@ a per-user installation. macOS also offers installation for all users.
 Application and shortcut names are always **SIGMA**, without a version suffix.
 Internal bundle metadata, private runtime paths and installer filenames retain
 the core version for compatibility checks and diagnosis. The user-supplied
-`assets/sigma-logo.png` is copied unchanged to the runtime and only resized when
-encoding ICO/ICNS. The same artwork appears on the startup screen and Qt windows.
+`assets/sigma-logo-original.png` is retained. `prepare_logo.py` deterministically
+extracts the emblem, removes the lower wordmark and white exterior, and preserves
+its interior artwork; the result `assets/sigma-logo.png` has real RGBA transparency.
+That prepared PNG is copied unchanged to the runtime and only resized when
+encoding ICO/ICNS. The same artwork appears on the transparent startup screen
+and Qt windows. App-icon encoding is tested for pixel and alpha preservation.
+
+The desktop adapter prepares Matplotlib's non-GUI modules and font cache in a
+single background worker. Opening Morphology Analysis while it is pending shows
+a loading message without blocking the Qt event loop. Figures and Qt canvases
+are created only on the GUI thread after preparation completes. Closing a panel
+never waits for font enumeration. This desktop-layer improvement leaves the
+published core wheel and scientific algorithms unchanged; a separately installed
+PyPI plugin does not acquire this desktop adapter automatically.
 
 | Target | Runtime | Compute default | Minimum OS |
 | --- | --- | --- | --- |
@@ -68,6 +80,8 @@ targets, installs the actual generated installer in a disposable runner, and run
 - CPU Frangi and segmentation smoke tests;
 - the existing core regression suite against the **installed wheel**, not `src/`;
 - shortcut existence/names, installed artwork, native icon and Windows uninstallation checks.
+- desktop GUI regressions for pending/failed imports, responsive tab changes,
+  main-thread canvas creation, shared preparation, and closing during loading.
 
 The smoke-test TIFF directory is owned by the verifier and removed after the GUI
 child exits; Windows cannot delete an actively displayed memory-mapped image.

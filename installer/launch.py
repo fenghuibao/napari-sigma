@@ -102,7 +102,7 @@ def main(argv=None) -> int:
         pixel_ratio = app.primaryScreen().devicePixelRatio()
         pixmap = QPixmap(round(420 * pixel_ratio), round(440 * pixel_ratio))
         pixmap.setDevicePixelRatio(pixel_ratio)
-        pixmap.fill(QColor("white"))
+        pixmap.fill(Qt.transparent)
         logo = QPixmap(str(RESOURCES / "sigma.png")).scaled(
             round(380 * pixel_ratio), round(380 * pixel_ratio),
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -111,6 +111,8 @@ def main(argv=None) -> int:
         painter.drawPixmap(20, 10, logo)
         painter.end()
         splash = QSplashScreen(pixmap)
+        splash.setWindowFlag(Qt.FramelessWindowHint)
+        splash.setAttribute(Qt.WA_TranslucentBackground)
         splash.setWindowTitle("SIGMA")
         splash.showMessage("Loading microscopy tools…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#082b50"))
         splash.show()
@@ -121,7 +123,12 @@ def main(argv=None) -> int:
 
         import napari
         import napari_sigma
-        from napari_sigma._widget import SIGMAWidget
+        # -I deliberately excludes the script directory from sys.path. Load
+        # only this explicitly trusted bundled desktop adapter by file path.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sigma_desktop_widget", RESOURCES / "desktop_widget.py")
+        desktop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(desktop)
         bundle = json.loads((RESOURCES / "bundle.json").read_text(encoding="utf-8"))
         if napari_sigma.__version__ != bundle["sigma_version"]:
             raise RuntimeError("SIGMA installation version mismatch. Reinstall the complete desktop package.")
@@ -133,7 +140,7 @@ def main(argv=None) -> int:
             viewer.window._qt_window.setWindowIcon(icon)
         viewer.events.theme.connect(restore_icon)
         restore_icon()
-        panel = SIGMAWidget(viewer)
+        panel = desktop.DesktopSIGMAWidget(viewer)
         dock = viewer.window.add_dock_widget(panel, name="SIGMA")
         panel.device_combo.setCurrentText(bundle["default_device"])
         viewer.show()

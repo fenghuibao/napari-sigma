@@ -142,6 +142,10 @@ class InstallerTests(unittest.TestCase):
             source = ROOT / "assets/sigma-logo.png"
             self.assertEqual((destination / "sigma.png").read_bytes(), source.read_bytes())
             with Image.open(source) as original:
+                self.assertEqual(original.mode, "RGBA")
+                self.assertEqual(original.getchannel("A").getextrema(), (0, 255))
+                self.assertEqual(original.getpixel((0, 0))[3], 0)
+                self.assertEqual(original.getpixel((original.width // 2, original.height - 1))[3], 0)
                 expected = original.convert("RGBA").resize((1024, 1024), Image.Resampling.LANCZOS)
             with Image.open(destination / "sigma.icns") as mac:
                 mac.size = (1024, 1024)

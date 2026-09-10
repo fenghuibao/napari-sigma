@@ -218,7 +218,7 @@ def main():
             run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
         run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requirements(target))
         records = lock_wheels(wheels, payload / "requirements.lock")
-    for name in ("launch.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
+    for name in ("launch.py", "desktop_widget.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
         shutil.copy2(HERE / name, payload / name)
     shutil.copy2(HERE.parent / "LICENSE", payload / "SIGMA-LICENSE.txt")
     make_icons(payload)

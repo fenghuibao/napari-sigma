@@ -38,6 +38,7 @@ def main():
     assert bundle["branding"]["logo_sha256"] == hashlib.sha256(source_logo.read_bytes()).hexdigest()
     python = prefix / ("python.exe" if sys.platform == "win32" else "bin/python")
     env = os.environ.copy()
+    env["SIGMA_DESKTOP_TEST_RESOURCES"] = str(resources)
     env.update(NUMBA_CACHE_DIR=str(output / "numba-cache"), MPLCONFIGDIR=str(output / "mpl-cache"), PYTHONWARNINGS="ignore")
     # A poisoned PYTHONPATH must not affect the -I entry point.
     poison = output / "poison-path"
@@ -49,6 +50,7 @@ def main():
         [python, "-I", "-m", "pip", "check"],
         [python, "-I", resources / "launch.py", "--smoke-test", "--screenshot", output / "desktop.png"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parents[1] / "tests", "-v"],
+        [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "gui_tests", "-v"],
     ]
     for index, command in enumerate(commands):
         command = [str(arg) for arg in command]
