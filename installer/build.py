@@ -52,7 +52,9 @@ def requirements(target: str) -> list[str]:
         "PyQt6==6.11.0", "PyQt6-Qt6==6.11.2", "qtpy==2.4.3",
         "openpyxl==3.1.5", "scikit-image==0.26.0",
     ]
-    result.append("tifffile<2026" if target == "osx-64" else "tifffile==2026.8.23")
+    # 2026.3.3 still supports Python 3.11/NumPy 1.x and includes the upstream
+    # high-resolution TIFF rational rounding fix (2026.2.20, issue #318).
+    result.append("tifffile==2026.3.3" if target == "osx-64" else "tifffile==2026.8.23")
     return result
 
 

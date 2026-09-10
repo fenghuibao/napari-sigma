@@ -1,6 +1,5 @@
 """Exercise installed manifest commands through npe2, not only direct helpers."""
 from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ from npe2 import PluginManager, io_utils
 from npe2.manifest import PluginManifest
 from PIL import Image
 import tifffile
+from _fixtures import temporary_directory
 
 import napari_sigma
 from napari_sigma._reader import napari_get_reader
@@ -34,7 +34,7 @@ class PluginProtocolRegressions(unittest.TestCase):
 
     def test_reader_dispatch_for_supported_formats(self):
         expected = np.arange(72, dtype=np.uint8).reshape(8, 9)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             for suffix in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
                 path = Path(tmp) / f"图像{suffix}"
                 if suffix in {".tif", ".tiff"}:
@@ -56,7 +56,7 @@ class PluginProtocolRegressions(unittest.TestCase):
         expected = np.full((2, 3, 8, 9), 2**40 + 1, dtype=np.uint64)
         attributes = {"name": "labels", "scale": (1, 2, .3, .2),
                       "metadata": {"dims": "TZYX", "unit": "um"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = Path(tmp) / "labels.tif"
             written, writer = io_utils.write_get_writer(
                 path, [(expected, attributes, "labels")], plugin_name="napari-sigma")
@@ -71,7 +71,7 @@ class PluginProtocolRegressions(unittest.TestCase):
     def test_writer_and_reader_dispatch_preserve_native_rgb(self):
         expected = np.arange(8 * 9 * 3, dtype=np.uint8).reshape(8, 9, 3)
         attributes = {"name": "rgb", "rgb": True, "scale": (.3, .2), "metadata": {}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = Path(tmp) / "rgb.tif"
             written, writer = io_utils.write_get_writer(
                 path, [(expected, attributes, "image")], plugin_name="napari-sigma")

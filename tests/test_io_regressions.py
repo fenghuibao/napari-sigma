@@ -4,12 +4,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 
 import numpy as np
 import tifffile
+from _fixtures import temporary_directory
 
 from napari_sigma._image_io import load_image_tc_zyx
 from napari_sigma._metadata import layer_dims_tag
@@ -22,7 +22,7 @@ class IORegressions(unittest.TestCase):
         import cv2
         frames = np.zeros((3, 16, 20, 3), dtype=np.uint8)
         frames[..., 0] = 180
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "movie.mp4")
             write_single_image(path, frames, {"metadata": {"fps": 5}})
             capture = cv2.VideoCapture(path)
@@ -42,7 +42,7 @@ class IORegressions(unittest.TestCase):
                 capture.release()
 
     def test_label_writer_protocol_and_large_ids(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "labels.tif")
             data = np.full((8, 9), 2**40 + 1, np.uint64)
             write_single_labels(path, data, {"scale": [.3, .2]})
@@ -51,7 +51,7 @@ class IORegressions(unittest.TestCase):
             np.testing.assert_array_equal(actual, data)
 
     def test_roundtrip_axes_labels_and_calibration(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             for dims, shape, scale in (("YX", (8, 9), (.3, .2)),
                     ("ZYX", (3, 8, 9), (2, .3, .2)),
                     ("TYX", (2, 8, 9), (1, .3, .2)),
@@ -73,7 +73,7 @@ class IORegressions(unittest.TestCase):
 
     def test_multichannel_imagej_reorders_data_and_spacing(self):
         raw = np.arange(2 * 2 * 3 * 8 * 9, dtype=np.uint16).reshape(2, 2, 3, 8, 9)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "channels.tif")
             write_single_image(path, raw, dict(scale=(1, 1, 2, .3, .2), metadata={"dims": "TCZYX"}))
             data, meta = load_image_tc_zyx(path)
@@ -86,7 +86,7 @@ class IORegressions(unittest.TestCase):
                 self.assertEqual(kwargs["metadata"]["dims"], "TZYX")
 
     def test_non_imagej_custom_metadata_and_units(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "calibration.tif")
             raw = np.full((3, 8, 9), 70000, np.uint32)
             write_single_image(path, raw, dict(scale=(.002, .0003, .0002), layer_type="labels",
@@ -103,7 +103,7 @@ class IORegressions(unittest.TestCase):
         self.assertEqual(layer_dims_tag(SimpleNamespace(metadata={"dims": "ZYX", "dims_out": "TZYX"})), "TZYX")
 
     def test_legacy_shaped_calibration_takes_precedence_over_inch_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "legacy.tif")
             tifffile.imwrite(path, np.full((3, 8, 9), 70000, np.uint32),
                 resolution=(5, 10 / 3), metadata={"axes": "ZYX", "unit": "um", "spacing": 2, "layer_type": "labels"})

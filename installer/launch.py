@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 import traceback
 
 RESOURCES = Path(__file__).resolve().parent
@@ -38,7 +37,7 @@ def prepare_process() -> Path:
     return logs / "desktop.log"
 
 
-def smoke_checks(viewer, panel) -> dict:
+def smoke_checks(viewer, panel, directory: Path) -> dict:
     import numpy as np
     import napari_sigma
     import torch
@@ -46,13 +45,16 @@ def smoke_checks(viewer, panel) -> dict:
     from napari_sigma.segmentation import segmentation
     from frangi_filter.frangi_filter import FrangiFilter
 
-    with tempfile.TemporaryDirectory(prefix="sigma-smoke-") as directory:
-        path = str(Path(directory) / "校准 labels.tif")
-        labels = np.full((2, 3, 8, 9), 2**40 + 1, np.uint64)
-        write_single_labels(path, labels, {"scale": (1, 2, .3, .2), "metadata": {"dims": "TZYX"}})
-        layer = viewer.open(path, plugin="napari-sigma")[0]
-        np.testing.assert_array_equal(layer.data, labels)
-        np.testing.assert_allclose(layer.scale, (1, 2, .3, .2))
+    # verify.py owns this directory and removes it only after this GUI process
+    # exits. napari keeps a memory map alive while displaying the TIFF, which
+    # correctly prevents deletion of the backing file on Windows.
+    path = str(directory / "校准 labels.tif")
+    labels = np.zeros((2, 3, 8, 9), np.uint64)
+    labels[:, :, 1:7, 2:8] = 2**40 + 1
+    write_single_labels(path, labels, {"scale": (1, 2, .3, .2), "metadata": {"dims": "TZYX"}})
+    layer = viewer.open(path, plugin="napari-sigma")[0]
+    np.testing.assert_array_equal(layer.data, labels)
+    np.testing.assert_allclose(layer.scale, (1, 2, .3, .2))
     raw = np.arange(256, dtype=np.uint16).reshape(16, 16)
     response = raw.astype(np.float32) / 255
     result, _ = segmentation(raw, response, pixel_size=(.1, .1), beta1=.5, beta2=1.,
@@ -71,8 +73,11 @@ def smoke_checks(viewer, panel) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--smoke-data-dir", type=Path)
     parser.add_argument("--screenshot", type=Path)
     args = parser.parse_args(argv)
+    if args.smoke_test and (args.smoke_data_dir is None or not args.smoke_data_dir.is_dir()):
+        parser.error("--smoke-test requires an existing --smoke-data-dir owned by the parent process")
     log_path = None
     splash = panel = viewer = None
     try:
@@ -116,12 +121,22 @@ def main(argv=None) -> int:
         # The scientific panel has a substantial minimum width. A small default
         # napari window can otherwise leave no visible image canvas.
         viewer.window._qt_window.showMaximized()
+        # A 1024-wide display cannot fit both sidebars plus the image. Keep
+        # layer controls/list accessible as tabs beside SIGMA on small screens.
+        if viewer.window._qt_window.screen().availableGeometry().width() < 1280:
+            for other in (viewer.window._qt_viewer.dockLayerControls,
+                          viewer.window._qt_viewer.dockLayerList):
+                viewer.window._qt_window.tabifyDockWidget(dock, other)
+            dock.raise_()
         viewer.window._qt_window.resizeDocks([dock], [panel.minimumWidth()], Qt.Horizontal)
         splash.finish(viewer.window._qt_window)
         app.processEvents()
         if args.smoke_test:
-            print(json.dumps(smoke_checks(viewer, panel)), flush=True)
+            print(json.dumps(smoke_checks(viewer, panel, args.smoke_data_dir)), flush=True)
             app.processEvents()
+            canvas = viewer.window._qt_viewer.canvas.native
+            if canvas.width() < 200 or canvas.height() < 120:
+                raise RuntimeError(f"Image canvas is obscured: {canvas.width()}x{canvas.height()}")
             if args.screenshot:
                 if not viewer.window._qt_window.grab().save(str(args.screenshot)):
                     raise RuntimeError("Could not save smoke-test screenshot.")

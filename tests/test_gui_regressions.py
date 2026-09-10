@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from _fixtures import temporary_directory
 import threading
 import time
 import unittest
@@ -26,7 +27,7 @@ class GuiRegressions(unittest.TestCase):
 
     def test_existing_edits_preserved_and_hooks_removed(self):
         from napari_sigma._writer import write_single_image
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             source = str(Path(tmp) / "source.tif")
             write_single_image(source, np.arange(256, dtype=np.float32).reshape(16, 16),
                                {"metadata": {"dims": "YX"}})
@@ -229,7 +230,7 @@ class GuiRegressions(unittest.TestCase):
         try:
             data = np.arange(8 * 9 * 3, dtype=np.uint8).reshape(8, 9, 3)
             viewer.add_image(data, rgb=True, scale=(.3, .2))
-            with tempfile.TemporaryDirectory() as tmp:
+            with temporary_directory(self) as tmp:
                 path = str(Path(tmp) / "rgb.tif")
                 with patch.object(_widget.QFileDialog, "getSaveFileName", return_value=(path, "")), \
                      patch.object(_widget.QMessageBox, "information"), \
@@ -251,7 +252,7 @@ class GuiRegressions(unittest.TestCase):
         from napari_sigma._writer import write_single_image, write_single_labels
         viewer = self.napari.Viewer(show=False)
         try:
-            with tempfile.TemporaryDirectory() as tmp:
+            with temporary_directory(self) as tmp:
                 image = np.arange(3 * 8 * 9, dtype=np.uint16).reshape(3, 8, 9)
                 labels = np.full((2, 3, 8, 9), 70000, dtype=np.uint32)
                 image_path = str(Path(tmp) / "image.tif")
@@ -291,7 +292,7 @@ w.dispose()
 w.close()
 v.close()
 '''
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             env = dict(os.environ, MPLCONFIGDIR=tmp)
             result = subprocess.run([sys.executable, "-c", code], env=env,
                                     capture_output=True, text=True, timeout=120)

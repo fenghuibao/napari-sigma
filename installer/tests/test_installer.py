@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,7 +23,7 @@ def module(name):
     return result
 
 
-build, install, launch = (module(name) for name in ("build", "install", "launch"))
+build, install, launch, verify = (module(name) for name in ("build", "install", "launch", "verify"))
 
 
 class InstallerTests(unittest.TestCase):
@@ -30,8 +31,54 @@ class InstallerTests(unittest.TestCase):
         intel = build.requirements("osx-64")
         self.assertIn("numpy==1.26.4", intel)
         self.assertIn("torch==2.2.2", intel)
+        self.assertIn("tifffile==2026.3.3", intel)
         self.assertIn("torch==2.13.0+cpu", build.requirements("win-64"))
         self.assertIn("torch==2.13.0", build.requirements("osx-arm64"))
+
+    def test_smoke_fixture_lives_until_child_exit_and_is_cleaned(self):
+        observed = []
+        def child(command, **kwargs):
+            directory = Path(command[command.index("--smoke-data-dir") + 1])
+            self.assertTrue(directory.is_dir())
+            (directory / "labels.tif").write_bytes(b"fixture")
+            observed.append(directory)
+            return subprocess.CompletedProcess(command, 0, b"ok")
+        with patch.object(verify.subprocess, "run", side_effect=child):
+            result = verify.run_smoke(Path(sys.executable), ROOT, ROOT, {})
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(observed[0].exists())
+
+    def test_smoke_fixture_is_cleaned_on_child_timeout(self):
+        observed = []
+        def child(command, **kwargs):
+            observed.append(Path(command[command.index("--smoke-data-dir") + 1]))
+            raise subprocess.TimeoutExpired(command, 1200)
+        with patch.object(verify.subprocess, "run", side_effect=child):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                verify.run_smoke(Path(sys.executable), ROOT, ROOT, {})
+        self.assertFalse(observed[0].exists())
+
+    def test_regression_fixture_outlives_local_memory_map(self):
+        import mmap
+        spec = importlib.util.spec_from_file_location("fixtures", ROOT.parent / "tests/_fixtures.py")
+        fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixtures)
+        observed = []
+        class FixtureCase(unittest.TestCase):
+            def runTest(case):
+                with fixtures.temporary_directory(case) as directory:
+                    path = Path(directory) / "mapped.bin"
+                    path.write_bytes(b"data")
+                    with path.open("r+b") as stream:
+                        mapped = mmap.mmap(stream.fileno(), 0)
+                case.assertTrue(path.exists())
+                case.assertEqual(mapped[:], b"data")
+                observed.append(Path(directory))
+                # Let the local map go out of scope, as real test arrays do.
+        result = unittest.TestResult()
+        FixtureCase().run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertFalse(observed[0].exists())
 
     def test_shortcuts_are_isolated_and_nonterminal(self):
         menu = build.menu_metadata("0.0.5")

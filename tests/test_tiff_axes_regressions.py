@@ -1,11 +1,11 @@
 """Pixel-exact TIFF axes and RGB round trips, including native napari metadata."""
 from itertools import permutations
 from pathlib import Path
-import tempfile
 import unittest
 
 import numpy as np
 import tifffile
+from _fixtures import temporary_directory
 
 from napari_sigma._image_io import _normalize_tiff_data_to_tczyx, load_image_tc_zyx
 from napari_sigma._reader import napari_get_reader
@@ -14,7 +14,7 @@ from napari_sigma._writer import write_single_image
 
 class TiffAxesRegressions(unittest.TestCase):
     def test_rgb_stacks_keep_channels_separate_from_z_and_time(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             for axes, shape in (("ZYXS", (5, 8, 9, 3)),
                                 ("TYXS", (5, 8, 9, 3)),
                                 ("TZYXS", (2, 5, 8, 9, 3))):
@@ -37,7 +37,7 @@ class TiffAxesRegressions(unittest.TestCase):
                         np.testing.assert_array_equal(array, raw[..., channel])
 
     def test_native_rgb_writer_uses_spatial_scale_without_sample_axis(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             for shape, scale, axes in (((8, 9, 3), (.3, .2), "YXS"),
                                       ((5, 8, 9, 3), (2, .3, .2), "ZYXS"),
                                       ((2, 5, 8, 9, 3), (1, 2, .3, .2), "TZYXS")):
@@ -56,11 +56,12 @@ class TiffAxesRegressions(unittest.TestCase):
 
     def test_rgb_movie_writer_roundtrip_accepts_legacy_and_spatial_scales(self):
         raw = np.arange(5 * 8 * 9 * 3, dtype=np.uint16).reshape(5, 8, 9, 3)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             for dims in ("TYXC", "TYXS", "TYX"):
                 for scale in ((1, .3, .2), (1, .3, .2, 1)):
                     with self.subTest(dims=dims, scale=scale):
-                        path = str(Path(tmp) / "movie.tif")
+                        # Do not overwrite another case's still-mapped file.
+                        path = str(Path(tmp) / f"movie-{dims}-{len(scale)}.tif")
                         write_single_image(path, raw, {
                             "rgb": True, "scale": scale,
                             "metadata": {"dims": dims, "time_interval": 7}})
@@ -86,7 +87,7 @@ class TiffAxesRegressions(unittest.TestCase):
 
     def test_ome_ctzyx_roundtrip_including_physical_metadata(self):
         raw = np.arange(4 * 2 * 5 * 8 * 9, dtype=np.uint16).reshape(4, 2, 5, 8, 9)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "channels.ome.tif")
             tifffile.imwrite(path, raw, ome=True, photometric="minisblack", metadata={
                 "axes": "CTZYX", "PhysicalSizeX": .2, "PhysicalSizeY": .3,
@@ -98,7 +99,7 @@ class TiffAxesRegressions(unittest.TestCase):
 
     def test_unannotated_page_axis_is_explicitly_assumed_z(self):
         raw = np.arange(5 * 8 * 9, dtype=np.uint16).reshape(5, 8, 9)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "pages.tif")
             tifffile.imwrite(path, raw, photometric="minisblack", metadata=None)
             actual, meta = load_image_tc_zyx(path)
@@ -154,7 +155,7 @@ class TiffAxesRegressions(unittest.TestCase):
 
     def test_legacy_rgb_movie_without_native_flag_still_roundtrips(self):
         raw = np.arange(2 * 8 * 9 * 3, dtype=np.uint16).reshape(2, 8, 9, 3)
-        with tempfile.TemporaryDirectory() as tmp:
+        with temporary_directory(self) as tmp:
             path = str(Path(tmp) / "legacy.tif")
             write_single_image(path, raw, {"metadata": {"dims": "TYXC"}, "scale": (1, .3, .2, 1)})
             actual, _ = load_image_tc_zyx(path)

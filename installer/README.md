@@ -13,6 +13,9 @@ a per-user installation. macOS also offers installation for all users.
 
 Intel uses the last available official Intel macOS Torch wheels. Windows CUDA and
 Windows ARM are not included. Separate backends are not promised bit-identical.
+Intel TIFF I/O uses tifffile 2026.3.3, which still supports Python 3.11/NumPy 1.x
+and includes the upstream high-resolution rational rounding fix. Calibration
+tests retain the same precision thresholds as the modern platforms.
 The CI uses macOS 15 and Windows Server 2022; this is not a substitute for testing
 every supported consumer OS/hardware combination.
 Windows rendering requires a working OpenGL driver. The GitHub Windows VM uses
@@ -59,6 +62,13 @@ targets, installs the actual generated installer in a disposable runner, and run
 - CPU Frangi and segmentation smoke tests;
 - the existing core regression suite against the **installed wheel**, not `src/`;
 - shortcut existence and Windows uninstallation checks.
+
+The smoke-test TIFF directory is owned by the verifier and removed after the GUI
+child exits; Windows cannot delete an actively displayed memory-mapped image.
+Regression fixtures likewise remain until test locals/viewers have been released.
+Cleanup errors are not ignored, and no pixel or numerical assertion is skipped.
+On displays narrower than 1280 logical pixels, layer controls/list share tabs with
+SIGMA to keep the image canvas visible; the smoke test also checks canvas size.
 
 Artifacts are uploaded even on failure for diagnosis; **only artifacts from a
 fully passing target should be distributed**. Logs/screenshots and the verification
