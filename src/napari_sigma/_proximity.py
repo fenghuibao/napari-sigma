@@ -242,8 +242,15 @@ def _instance_labels_from_layer(layer, mask: np.ndarray, voxel_size: tuple[float
     with np.errstate(all="ignore"):
         unique = np.unique(arr)
     nonzero = unique[unique != 0]
-    if nonzero.size > 1 and np.allclose(arr, np.round(arr)):
-        labels = np.asarray(np.round(arr), dtype=np.int32)
+    integer_dtype = arr.dtype.kind in "ui"
+    if nonzero.size > 1 and (integer_dtype or np.allclose(arr, np.round(arr))):
+        if integer_dtype:
+            # Preserve uint64 IDs exactly; even np.round may pass through float.
+            labels = np.array(arr, copy=True)
+        else:
+            if not np.isfinite(arr).all() or np.any(np.abs(arr) > 2**53):
+                raise ValueError("Large instance IDs must use an integer array dtype.")
+            labels = np.round(arr).astype(np.int64)
         labels[~mask] = 0
         return labels
 
@@ -270,6 +277,25 @@ def _instance_labels_from_layer(layer, mask: np.ndarray, voxel_size: tuple[float
 
     labels, _n = ndi.label(mask)
     return np.asarray(labels, dtype=np.int32)
+
+
+def _compact_object_ids(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Index labels densely for distance maps, with an exact original-ID lookup."""
+    original_ids = np.unique(labels)
+    original_ids = original_ids[original_ids > 0]
+    if original_ids.size > np.iinfo(np.int32).max:
+        raise ValueError("Too many source objects for proximity analysis.")
+    compact = np.zeros(labels.shape, dtype=np.int32)
+    source = labels.reshape(-1)
+    destination = compact.reshape(-1)
+    # Bound the temporary int64 search indices for large volumes.
+    for start in range(0, source.size, 1_048_576):
+        block = source[start:start + 1_048_576]
+        positive = block > 0
+        destination[start:start + block.size][positive] = (
+            np.searchsorted(original_ids, block[positive]).astype(np.int32) + 1
+        )
+    return compact, original_ids
 
 
 def _raw_from_layer(layer) -> np.ndarray:
@@ -408,6 +434,7 @@ def _compute_target_proximity_rows_for_source_objects(
     nearest_source_labels: np.ndarray,
     next_global_id: int,
     target_physical_size_fn=None,
+    source_id_values: np.ndarray | None = None,
 ) -> tuple[np.ndarray, list[ProximityComponentRow], int]:
     rows: list[ProximityComponentRow] = []
     labels_out = np.zeros_like(source_labels, dtype=np.int32)
@@ -426,6 +453,7 @@ def _compute_target_proximity_rows_for_source_objects(
 
     object_records.sort(key=lambda item: (-int(item[0]), int(item[1])))
     for source_size, object_id in object_records:
+        original_id = int(source_id_values[object_id - 1]) if source_id_values is not None else object_id
         source_object = np.logical_and(source_labels == object_id, roi_mask)
         target_near_object = np.logical_and(target_proximity, nearest_source_labels == object_id)
         global_id = next_global_id
@@ -441,11 +469,11 @@ def _compute_target_proximity_rows_for_source_objects(
             ProximityComponentRow(
                 roi_id=roi_id,
                 frame=_format_frame_for_mask(source_object, fallback_frame),
-                component_id=int(object_id),
+                component_id=original_id,
                 global_component_id=global_id,
                 size=target_near_size,
                 size_physical=target_near_size_physical,
-                source_label=int(object_id),
+                source_label=original_id,
                 source_size=int(source_size),
                 source_size_physical=float(source_size * voxel_measure),
             )
@@ -687,7 +715,8 @@ def compute_proximity_result(
     check_cancelled()
     source_basis_all = _surface_mask(source_mask_all, voxel_size) if surface_only else source_mask_all
     target_basis_all = _surface_mask(target_mask_all, voxel_size) if surface_only else target_mask_all
-    source_labels_all = _instance_labels_from_layer(source_seg_layer, source_mask_all, voxel_size)
+    source_object_labels = _instance_labels_from_layer(source_seg_layer, source_mask_all, voxel_size)
+    source_labels_all, source_id_values = _compact_object_ids(source_object_labels)
     nearest_source_labels_all = _nearest_labels_to_mask(source_labels_all, distance_voxel_size)
     check_cancelled()
     combined_source_mask = np.zeros_like(source_mask_all, dtype=bool)
@@ -778,6 +807,7 @@ def compute_proximity_result(
                 target_distance_to_source=target_distance_to_source,
                 nearest_source_labels=nearest_source_labels_all,
                 next_global_id=next_global_id,
+                source_id_values=source_id_values,
                 target_physical_size_fn=lambda selection: _selection_physical_measure(
                     target_mask_all,
                     selection,
@@ -854,7 +884,7 @@ def compute_proximity_result(
         source_proximity_mask=combined_source_proximity_mask,
         target_proximity_mask=combined_target_proximity_mask,
         proximity_mask=combined_proximity_mask,
-        source_object_labels=np.asarray(source_labels_all, dtype=np.int32),
+        source_object_labels=source_object_labels,
         component_labels=combined_component_labels,
         summary_rows=summary_rows,
         component_rows=component_rows,

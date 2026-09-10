@@ -71,6 +71,7 @@ def _axes_for_ndim(ndim: int) -> str:
 
 def _axes_from_meta(meta: dict, ndim: int) -> str:
     layer_meta = meta.get("metadata", {}) or {}
+    rgb = bool(meta.get("rgb", False))
     candidates = [
         layer_meta.get("dims_out"),
         layer_meta.get("dims"),
@@ -81,9 +82,11 @@ def _axes_from_meta(meta: dict, ndim: int) -> str:
     ]
     for candidate in candidates:
         axes = str(candidate or "").upper()
-        if axes and len(axes) == ndim:
+        if axes and len(axes) == ndim and (not rgb or axes.endswith(("C", "S"))):
             return axes
-    return _axes_for_ndim(ndim)
+        if rgb and len(axes) == ndim - 1 and "S" not in axes:
+            return axes + "S"
+    return _axes_for_ndim(ndim - 1) + "S" if rgb else _axes_for_ndim(ndim)
 
 
 def _coerce_tiff_dtype(arr: np.ndarray) -> tuple[np.ndarray, bool]:
@@ -112,10 +115,18 @@ def _coerce_tiff_dtype(arr: np.ndarray) -> tuple[np.ndarray, bool]:
 
 def _write_tiff(path: str, data: np.ndarray, meta: dict) -> None:
     arr, imagej_ok = _coerce_tiff_dtype(np.asarray(data))
-    scale = _scale_from_meta(meta, arr.ndim)
     unit = _unit_from_meta(meta)
     axes = _axes_from_meta(meta, arr.ndim)
-    is_rgb = bool(arr.ndim >= 3 and arr.shape[-1] in (3, 4) and axes.endswith("C"))
+    is_rgb = bool(arr.ndim >= 3 and arr.shape[-1] in (3, 4) and axes.endswith(("C", "S")))
+    if meta.get("rgb") and not is_rgb:
+        raise ValueError("RGB TIFF export requires a final sample axis of length 3 or 4.")
+    raw_scale = meta.get("scale")
+    if is_rgb and (raw_scale is None or len(raw_scale) < arr.ndim):
+        # napari's RGB scale excludes the final samples axis. Legacy SIGMA
+        # exports may instead supply a scale entry for every array axis.
+        scale = _scale_from_meta(meta, arr.ndim - 1) + (1.0,)
+    else:
+        scale = _scale_from_meta(meta, arr.ndim)
     if imagej_ok and not is_rgb and set(axes) <= set("TZCYX") and len(set(axes)) == len(axes):
         ordered_axes = "".join(axis for axis in "TZCYX" if axis in axes)
         order = tuple(axes.index(axis) for axis in ordered_axes)

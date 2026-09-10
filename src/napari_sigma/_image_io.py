@@ -264,55 +264,75 @@ def _is_probable_time_series(imagej_meta: dict[str, Any] | None) -> bool:
     return False
 
 
+def _interpret_tiff_axes(
+    axes: str, ndim: int, imagej_meta: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Resolve an unlabelled page axis; keep assumptions separate from metadata."""
+    axes = axes.upper()
+    original = axes
+    if len(axes) != ndim or len(set(axes)) != ndim or not {"Y", "X"} <= set(axes):
+        raise ValueError(f"Unsupported TIFF axes layout: {axes} for {ndim} dimensions")
+    assumptions = {}
+    page_axes = set(axes) & {"I", "Q"}
+    if len(page_axes) == 1 and "Z" not in axes:
+        page_axis = page_axes.pop()
+        # Without acquisition metadata a page index cannot establish time vs Z.
+        # Default to Z, and expose this assumption in the returned file metadata.
+        inferred = "T" if "T" not in axes and _is_probable_time_series(imagej_meta) else "Z"
+        assumptions[page_axis] = inferred
+        axes = axes.replace(page_axis, inferred)
+    elif axes in {"ZYX", "ZYXS", "ZYXC"} and _is_probable_time_series(imagej_meta):
+        # Retain support for legacy ImageJ movies stored as Z stacks.
+        assumptions["Z"] = "T"
+        axes = axes.replace("Z", "T")
+    if not set(axes) <= set("TCZYXS"):
+        raise ValueError(f"Unsupported or ambiguous TIFF axes layout: {original}")
+    return axes, assumptions
+
+
 def _normalize_tiff_data_to_tczyx(
     data: np.ndarray,
     axes: str,
     imagej_meta: dict[str, Any] | None = None,
-) -> tuple[np.ndarray, list[str], str | None]:
-    axes = axes.upper()
-    if axes == "YX":
-        return data[np.newaxis, np.newaxis, np.newaxis, :, :], ["Channel 1"], "YX"
-    if axes == "TYX":
-        return data[:, np.newaxis, np.newaxis, :, :], ["Channel 1"], "TYX"
-    if axes == "ZYX":
-        if _is_probable_time_series(imagej_meta):
-            return data[:, np.newaxis, np.newaxis, :, :], ["Channel 1"], "TYX"
-        return data[np.newaxis, np.newaxis, :, :, :], ["Channel 1"], "ZYX"
-    if axes == "TZYX":
-        return data[:, np.newaxis, :, :, :], ["Channel 1"], "TZYX"
-    if axes in {"CYX", "SYX"}:
-        return data[np.newaxis, :, np.newaxis, :, :], ["Red", "Green", "Blue"][: data.shape[0]], "CYX"
-    if axes == "TCYX":
-        return data[:, :, np.newaxis, :, :], [f"Channel {i+1}" for i in range(data.shape[1])], "TCYX"
-    if axes == "TZCYX":
-        # moveaxis returns a view when possible, so normalization does not require
-        # copying a potentially large movie merely to establish one storage contract.
-        normalized = np.moveaxis(data, 2, 1)
-        return normalized, [f"Channel {i+1}" for i in range(data.shape[2])], "TCZYX"
-    if axes == "ZCYX":
-        return (
-            np.moveaxis(data, 1, 0)[np.newaxis, ...],
-            [f"Channel {i+1}" for i in range(data.shape[1])],
-            "CZYX",
-        )
-    if axes in {"YXS", "YXC"}:
-        if _rgb_channels_are_identical(data):
-            return data[..., 0][np.newaxis, np.newaxis, np.newaxis, :, :], ["Channel 1"], "YX"
-        rgb = data[..., :3]
-        return np.moveaxis(rgb, -1, 0)[np.newaxis, :, np.newaxis, :, :], ["Red", "Green", "Blue"], "CYX"
-    if axes in {"ZYXS", "ZYXC"}:
-        if _rgb_channels_are_identical(data):
-            gray = data[..., 0]
-            if _is_probable_time_series(imagej_meta):
-                return gray[:, np.newaxis, np.newaxis, :, :], ["Channel 1"], "TYX"
-            return gray[np.newaxis, np.newaxis, :, :, :], ["Channel 1"], "ZYX"
-        rgb_stack = data[..., :3]
-        return np.moveaxis(rgb_stack, -1, 1)[np.newaxis, ...], ["Red", "Green", "Blue"], "CZYX"
-    if axes == "CZYX":
-        return data[np.newaxis, ...], [f"Channel {i+1}" for i in range(data.shape[0])], "CZYX"
-    if axes == "TCZYX":
-        return data, [f"Channel {i+1}" for i in range(data.shape[1])], "TCZYX"
-    raise ValueError(f"Unsupported TIFF axes layout: {axes}")
+) -> tuple[np.ndarray, list[str], str]:
+    """Transpose named axes, never infer channel/Z order from dimension sizes."""
+    axes, _ = _interpret_tiff_axes(axes, data.ndim, imagej_meta)
+    # Legacy exports used a trailing C for RGB samples; TIFF itself uses S.
+    if axes.endswith("C") and "S" not in axes and data.shape[-1] in (3, 4):
+        axes = axes[:-1] + "S"
+
+    sample_names = None
+    if "S" in axes:
+        sample_index = axes.index("S")
+        samples = np.moveaxis(data, sample_index, -1)
+        if samples.shape[-1] in (3, 4):
+            if "C" not in axes and _rgb_channels_are_identical(samples):
+                data = samples[..., 0]
+                axes = axes.replace("S", "")
+            else:
+                # Preserve SIGMA's existing RGB convention: discard alpha.
+                data = np.moveaxis(samples[..., :3], -1, sample_index)
+                sample_names = ["Red", "Green", "Blue"]
+
+    if "S" in axes and "C" not in axes:
+        axes = axes.replace("S", "C")
+    target_axes = "TCSZYX" if "S" in axes else "TCZYX"
+    ordered_axes = "".join(axis for axis in target_axes if axis in axes)
+    normalized = data.transpose(tuple(axes.index(axis) for axis in ordered_axes))
+    for index, axis in enumerate(target_axes):
+        if axis not in axes:
+            normalized = np.expand_dims(normalized, index)
+    if "S" in axes:
+        # Multiple logical channels can each contain RGB samples. Flatten only
+        # those two channel axes, keeping time and spatial axes untouched.
+        t, c, s, z, y, x = normalized.shape
+        names = [f"Channel {i + 1} {name}" for i in range(c)
+                 for name in (sample_names or [f"Sample {j + 1}" for j in range(s)])]
+        normalized = normalized.reshape(t, c * s, z, y, x)
+    else:
+        names = sample_names or [f"Channel {i + 1}" for i in range(normalized.shape[1])]
+    dims = "".join(axis for axis in "TCZYX" if axis in axes)
+    return normalized, names, dims
 
 
 def load_image_tc_zyx(path: str) -> tuple[np.ndarray, dict[str, Any]]:
@@ -327,8 +347,11 @@ def load_image_tc_zyx(path: str) -> tuple[np.ndarray, dict[str, Any]]:
                 data = series.asarray()
             axes = str(series.axes).upper()
             imagej_meta = tif.imagej_metadata or {}
+            _, axis_assumptions = _interpret_tiff_axes(axes, data.ndim, imagej_meta)
             data, ch_names, inferred_dims = _normalize_tiff_data_to_tczyx(data, axes, imagej_meta)
         zyx_scale, unit, extras = _read_tiff_scale_metadata(path)
+        if axis_assumptions:
+            extras["axis_assumptions"] = axis_assumptions
     else:
         inferred_dims = None
         data = np.asarray(Image.open(path))
@@ -353,7 +376,7 @@ def load_image_tc_zyx(path: str) -> tuple[np.ndarray, dict[str, Any]]:
         elif data.ndim == 4:
             if data.shape[-1] in (3, 4):
                 rgb_stack = data[..., :3]
-                data = np.moveaxis(rgb_stack, -1, 1)[np.newaxis, ...]
+                data = np.moveaxis(rgb_stack, -1, 0)[np.newaxis, ...]
                 ch_names = ["Red", "Green", "Blue"]
                 inferred_dims = "CZYX"
             else:

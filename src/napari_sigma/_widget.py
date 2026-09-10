@@ -1786,6 +1786,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
         self._disposed = False
+        self._worker_callback_generation = 0
         self._hooks_installed = False
         self._viewer_connections = []
         self._menu_patch = None
@@ -1851,6 +1852,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._layer_combo_state = None
         self._analysis_thread = None
         self._analysis_worker = None
+        # Replaced analysis requests remain owned until their threads stop.
+        self._analysis_jobs = {}
         self._analysis_export_thread = None
         self._analysis_export_worker = None
         self._analysis_request_id = 0
@@ -2053,13 +2056,21 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         if self._disposed:
             return
         self._disposed = True
+        self._worker_callback_generation += 1
+        self._analysis_request_id += 1
+        self._analysis_pending_frame_key = None
         for timer in self.findChildren(QTimer):
             timer.stop()
+        for thread, worker in list(self._analysis_jobs.items()):
+            worker.cancel()
+            thread.requestInterruption()
         for name in ("analysis", "analysis_export", "tracking", "frangi", "upsample",
                      "denoise", "gaussian", "seg", "proximity"):
             thread_attr, worker_attr = f"_{name}_thread", f"_{name}_worker"
             self._request_worker_cancel(thread_attr, worker_attr)
             self._cleanup_worker_thread(thread_attr, worker_attr)
+        for thread in list(self._analysis_jobs):
+            self._cleanup_analysis_job(thread)
         for emitter, callback in self._viewer_connections:
             with suppress(Exception):
                 emitter.disconnect(callback)
@@ -2126,8 +2137,15 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             callback(*tuple(args))
 
     def _connect_worker_callback(self, signal, callback) -> None:
+        generation = self._worker_callback_generation
+
+        def deliver(*args):
+            # Closing and reopening a panel must not revive queued old results.
+            if generation == self._worker_callback_generation:
+                callback(*args)
+
         signal.connect(
-            lambda *args: self._main_thread_dispatch.emit(callback, args)
+            lambda *args: self._main_thread_dispatch.emit(deliver, args)
         )
 
     def _request_worker_cancel(self, thread_attr: str, worker_attr: str) -> None:
@@ -2145,6 +2163,13 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     def _cleanup_worker_thread(self, thread_attr: str, worker_attr: str) -> None:
         thread = getattr(self, thread_attr, None)
         worker = getattr(self, worker_attr, None)
+        self._analysis_jobs.pop(thread, None)
+        self._release_worker_resources(thread, worker)
+        setattr(self, worker_attr, None)
+        setattr(self, thread_attr, None)
+
+    @staticmethod
+    def _release_worker_resources(thread, worker) -> None:
         if worker is not None:
             with suppress(Exception):
                 worker.deleteLater()
@@ -2156,8 +2181,15 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         if thread is not None:
             with suppress(Exception):
                 thread.deleteLater()
-        setattr(self, worker_attr, None)
-        setattr(self, thread_attr, None)
+
+    def _cleanup_analysis_job(self, thread) -> None:
+        worker = self._analysis_jobs.pop(thread, None)
+        if worker is None:
+            return
+        if self._analysis_thread is thread:
+            self._analysis_thread = None
+            self._analysis_worker = None
+        self._release_worker_resources(thread, worker)
 
     def _start_analysis_refresh(self, layer, *, frame_key: tuple[int, int | None]) -> None:
         frame_index = self._analysis_current_frame_index(layer)
@@ -2190,19 +2222,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
-        def _finish(payload, error, *, this_thread=thread, this_worker=worker, expected_request_id=request_id):
-            is_latest = self._analysis_thread is this_thread and self._analysis_worker is this_worker
-            if is_latest:
-                self._analysis_thread = None
-                self._analysis_worker = None
-            with suppress(Exception):
-                this_thread.quit()
-            with suppress(Exception):
-                this_thread.wait()
-            with suppress(Exception):
-                this_worker.deleteLater()
-            with suppress(Exception):
-                this_thread.deleteLater()
+        def _finish(payload, error, *, this_thread=thread, expected_request_id=request_id):
+            self._cleanup_analysis_job(this_thread)
 
             if payload is None:
                 if isinstance(error, AnalysisCancelledError):
@@ -2231,6 +2252,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             )
 
         self._connect_worker_callback(worker.finished, _finish)
+        self._analysis_jobs[thread] = worker
         self._analysis_thread = thread
         self._analysis_worker = worker
         thread.start()
@@ -3308,6 +3330,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             "metadata": layer_metadata,
             "name": layer.name,
             "layer_type": getattr(layer, "_type_string", "image"),
+            "rgb": bool(getattr(layer, "rgb", False)),
         }
         try:
             write_single_image(path, np.asarray(layer.data), meta)
@@ -12420,7 +12443,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             arr = base_layer.data
             dims_tag = _layer_dims_tag(base_layer)
             # Infer dims from array shape when metadata tag is absent
-            if dims_tag is None:
+            if not dims_tag:
                 if arr.ndim == 4:
                     dims_tag = "TZYX"
                 elif arr.ndim == 3:
@@ -12628,7 +12651,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         try:
             arr = base_layer.data
             dims_tag = _layer_dims_tag(base_layer)
-            if dims_tag is None:
+            if not dims_tag:
                 if arr.ndim == 4:
                     dims_tag = "TZYX"
                 elif arr.ndim == 3:
@@ -13168,7 +13191,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     def _extract_processing_series(self, layer) -> tuple[np.ndarray, int, float, str | None]:
         arr = layer.data
         dims_tag = _layer_dims_tag(layer)
-        if dims_tag is None and getattr(arr, "ndim", None) == 4:
+        if not dims_tag and getattr(arr, "ndim", None) == 4:
             # SIGMA splits channels into separate layers, so an unlabeled 4D
             # image layer is the common napari TZYX representation.
             dims_tag = "TZYX"

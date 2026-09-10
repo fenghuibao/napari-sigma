@@ -43,13 +43,12 @@ def tczyx_to_layer_data(data, meta: dict, name: str):
     return layers
 
 
-def napari_get_reader(paths):
-    if isinstance(paths, (list, tuple)):
-        if len(paths) != 1:
+def napari_get_reader(path):
+    # npe2 invokes this command with the keyword argument ``path``.
+    if isinstance(path, (list, tuple)):
+        if len(path) != 1:
             return None
-        path = paths[0]
-    else:
-        path = paths
+        path = path[0]
     if not os.fspath(path).lower().endswith(SUPPORTED_IMAGE_SUFFIXES):
         return None
 

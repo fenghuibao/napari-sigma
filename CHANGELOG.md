@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.5
+
+- Fix the reader factory's parameter name to accept npe2's `path=` keyword, restoring SIGMA reads through napari's file-open/drop flow.
+- Add manifest-dispatch regression tests for TIFF/PNG/JPEG, single-file stack calls, and calibrated uint64 time-series labels through both writer and reader commands.
+- Track all outstanding analysis workers, including superseded requests; cancel and join them on panel disposal, and reject queued results from an earlier panel lifecycle after reopening.
+- Restore full selected-time-range processing for unannotated 4D images in Median, Gaussian background subtraction, and shared Frangi/segmentation input extraction.
+- Normalize TIFF axes by name, fixing RGB channel/Z swaps and supporting RGB movies/volumes, OME C/T/Z permutations, and unannotated I/Q page stacks. Expose unlabelled-page axis assumptions in metadata instead of treating the default Z interpretation as acquisition metadata.
+- Respect native napari RGB state in both writer dispatch and the custom save menu. Preserve spatial calibration when RGB scale excludes the samples axis, while retaining legacy TYXC export compatibility.
+- Preserve large integer instance IDs in Proximity by using compact internal distance-map IDs with an exact original-ID lookup. Keep existing binary-mask labelling and repeated-ID time aggregation behavior.
+- Add pixel-exact TIFF round trips, large uint32/uint64 ID comparisons, real preprocessing-button/save-menu checks, and overlapping-worker close/reopen regression tests.
+
 ## 0.0.4
 
 ### Correctness and data protection
