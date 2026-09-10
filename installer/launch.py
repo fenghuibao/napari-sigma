@@ -33,6 +33,7 @@ def prepare_process() -> Path:
         directory.mkdir(parents=True, exist_ok=True)
     os.environ["NUMBA_CACHE_DIR"] = str(cache / "numba")
     os.environ["MPLCONFIGDIR"] = str(cache / "matplotlib")
+    os.environ["MPL_IGNORE_SYSTEM_FONTS"] = "1"
     os.environ["NAPARI_CONFIG"] = str(configuration / "napari.yaml")
     return logs / "desktop.log"
 

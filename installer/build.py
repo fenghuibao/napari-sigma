@@ -51,6 +51,7 @@ def requirements(target: str) -> list[str]:
         f"torch=={torch}", f"numpy=={'1.26.4' if target == 'osx-64' else '2.5.2'}",
         "PyQt6==6.11.0", "PyQt6-Qt6==6.11.2", "qtpy==2.4.3",
         "openpyxl==3.1.5", "scikit-image==0.26.0",
+        "matplotlib==3.11.1",
     ]
     # 2026.3.3 still supports Python 3.11/NumPy 1.x and includes the upstream
     # high-resolution TIFF rational rounding fix (2026.2.20, issue #318).
@@ -96,6 +97,34 @@ def validated_cached_wheels(payload: Path, target: str) -> list[dict]:
         if records != bundle["wheels"] or lock.read_bytes() != (payload / "requirements.lock").read_bytes():
             raise ValueError("Cached wheels or hash lock changed; use a fresh build directory")
     return records
+
+
+def build_font_index(python: Path, work: Path, payload: Path, records: list[dict]) -> dict:
+    # Never pip-install into the conda runtime before constructor inventories it.
+    # The font-only venv is disposable and excluded from the delivered runtime.
+    names = {"matplotlib", "contourpy", "cycler", "fonttools", "kiwisolver", "numpy",
+             "packaging", "pillow", "pyparsing", "python-dateutil", "six"}
+    selected = [record for record in records if record["name"] in names]
+    if {record["name"] for record in selected} != names:
+        raise RuntimeError("Locked wheelhouse is missing a font-index build dependency")
+    lock = work / "font-requirements.lock"
+    lock.write_text("\n".join(
+        f"{record['name']}=={record['version']} --hash=sha256:{record['sha256']}"
+        for record in selected) + "\n", encoding="utf-8")
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("PIP_")}
+    env.update(PIP_CONFIG_FILE=os.devnull, MPLCONFIGDIR=str(work / "builder-font-cache"),
+               MPL_IGNORE_SYSTEM_FONTS="1")
+    with tempfile.TemporaryDirectory(prefix="font-index-", dir=work) as directory:
+        environment = Path(directory)
+        run([python, "-I", "-m", "venv", "--without-pip", environment])
+        pip = [python, "-I", "-m", "pip", "--isolated", "--python", environment]
+        run(pip + ["install", "--no-index", "--find-links", payload / "wheelhouse", "--require-hashes",
+                   "--no-deps", "--no-compile", "--no-cache-dir", "--disable-pip-version-check", "-r", lock], env=env)
+        run(pip + ["check"], env=env)
+        font_python = environment / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        run([font_python, "-I", HERE / "generate_font_cache.py", "--output", payload / "font-cache"], env=env)
+    manifest = (payload / "font-cache/manifest.json").read_bytes()
+    return {"mode": "bundled-only", "manifest_sha256": hashlib.sha256(manifest).hexdigest()}
 
 
 def menu_metadata(version: str) -> dict:
@@ -218,7 +247,8 @@ def main():
             run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
         run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requirements(target))
         records = lock_wheels(wheels, payload / "requirements.lock")
-    for name in ("launch.py", "desktop_widget.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
+    font_cache = build_font_index(python, work, payload, records)
+    for name in ("launch.py", "desktop_widget.py", "font_cache.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
         shutil.copy2(HERE / name, payload / name)
     shutil.copy2(HERE.parent / "LICENSE", payload / "SIGMA-LICENSE.txt")
     make_icons(payload)
@@ -227,6 +257,7 @@ def main():
         "schema": 1, "sigma_version": VERSION, "platform": target,
         "default_device": "auto" if target == "osx-arm64" else "cpu",
         "branding": {"name": "SIGMA", "logo_sha256": hashlib.sha256((payload / "sigma.png").read_bytes()).hexdigest()},
+        "font_cache": font_cache,
         "signed": False, "wheels": records,
     }, indent=2), encoding="utf-8")
     (work / "construct.yaml").write_text(yaml.safe_dump(

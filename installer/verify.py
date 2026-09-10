@@ -16,7 +16,8 @@ def run_smoke(python: Path, resources: Path, output: Path, env: dict):
     # The child keeps TIFF memory maps alive until GUI shutdown. In particular,
     # Windows cannot unlink them earlier. Cleanup errors must not be suppressed.
     with tempfile.TemporaryDirectory(prefix="sigma-smoke-") as directory:
-        command = [str(python), "-I", str(resources / "launch.py"), "--smoke-test",
+        command = [str(python), "-I", str(Path(__file__).resolve().parent / "font_tests/font_probe.py"),
+                   "--launch", str(resources / "launch.py"), "--smoke-test",
                    "--smoke-data-dir", directory, "--screenshot", str(output / "desktop.png")]
         return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               env=env, timeout=1200)
@@ -51,6 +52,7 @@ def main():
         [python, "-I", resources / "launch.py", "--smoke-test", "--screenshot", output / "desktop.png"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parents[1] / "tests", "-v"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "gui_tests", "-v"],
+        [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "font_tests", "-v"],
     ]
     for index, command in enumerate(commands):
         command = [str(arg) for arg in command]

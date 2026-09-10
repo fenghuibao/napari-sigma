@@ -18,6 +18,13 @@ The installed runtime occupies more space than the compressed download.
 Intel Mac uses an older compatible PyTorch/NumPy combination; results across
 different devices or dependency versions are not promised to be bit-identical.
 
+CHART STARTUP
+SIGMA includes its chart fonts and a ready-to-use font index. It does not scan
+your computer's system fonts. A deleted/corrupt user font cache is restored from
+the app. Chart modules still load in the background, keeping the interface usable.
+Charts use bundled DejaVu/STIX fonts; arbitrary system fonts and Chinese chart
+labels need a separately supplied font. Normal application UI fonts are unchanged.
+
 SECURITY
 These are unsigned test installers, not notarized/certified releases. macOS
 Gatekeeper or Windows SmartScreen may block them. Do not disable those controls;

@@ -6,6 +6,8 @@ and Qt canvas is still created and used exclusively on the GUI thread.
 from __future__ import annotations
 
 import importlib
+import importlib.util
+from pathlib import Path
 import threading
 from time import perf_counter
 
@@ -15,7 +17,13 @@ from napari_sigma._widget import SIGMAWidget
 
 def prepare_plot_modules():
     # No pyplot, Qt backend selection, figures, or GUI objects in this thread.
-    # figure/backend_agg transitively load the persistent font cache.
+    # Restore the bundled-only index before anything can initialize font_manager.
+    # -I excludes the script directory: load the helper by its trusted file path.
+    resources = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("sigma_fonts", resources / "font_cache.py")
+    fonts = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fonts)
+    fonts.prepare_font_cache(resources)
     importlib.import_module("matplotlib.figure")
     importlib.import_module("matplotlib.backends.backend_agg")
 
@@ -62,7 +70,7 @@ class DesktopSIGMAWidget(SIGMAWidget):
         super().__init__(viewer)
         self._desktop_plot_preparation = plot_preparation or shared_preparation()
         self._analysis_plot_placeholder.setText(
-            "Preparing charts and font cache in the background… You can keep using SIGMA.")
+            "Preparing charts with bundled fonts in the background… You can keep using SIGMA.")
         self._desktop_plot_timer = QTimer(self)
         self._desktop_plot_timer.setInterval(50)
         self._desktop_plot_timer.timeout.connect(self._poll_plot_preparation)

@@ -15,8 +15,21 @@ That prepared PNG is copied unchanged to the runtime and only resized when
 encoding ICO/ICNS. The same artwork appears on the transparent startup screen
 and Qt windows. App-icon encoding is tested for pixel and alpha preservation.
 
-The desktop adapter prepares Matplotlib's non-GUI modules and font cache in a
-single background worker. Opening Morphology Analysis while it is pending shows
+The desktop app uses Matplotlib 3.11.1's official `MPL_IGNORE_SYSTEM_FONTS=1`
+setting and a pre-generated index containing only the fonts shipped in that wheel.
+The builder generates the index in a separate disposable, hash-locked font-only
+venv (never in the conda runtime that constructor packages). Relative font paths,
+exact Matplotlib version, and index/font hashes are checked on the user's machine.
+A missing or corrupt per-user cache is restored atomically from the bundled index;
+it does not trigger operating-system font discovery. Damaged installed assets or
+incompatible library versions produce an explicit error instead of a silent scan.
+No system-wide font settings, Matplotlib source files, or other Python environments
+are changed. Chart fonts are the bundled DejaVu/STIX and standard Matplotlib fonts;
+custom system fonts and CJK chart labels require an explicitly supplied matching
+font rather than automatic system discovery. Qt's normal UI fonts are unaffected.
+
+The desktop adapter still prepares Matplotlib's non-GUI modules in a single
+background worker. Opening Morphology Analysis while it is pending shows
 a loading message without blocking the Qt event loop. Figures and Qt canvases
 are created only on the GUI thread after preparation completes. Closing a panel
 never waits for font enumeration. This desktop-layer improvement leaves the
@@ -82,6 +95,10 @@ targets, installs the actual generated installer in a disposable runner, and run
 - shortcut existence/names, installed artwork, native icon and Windows uninstallation checks.
 - desktop GUI regressions for pending/failed imports, responsive tab changes,
   main-thread canvas creation, shared preparation, and closing during loading.
+- isolated cold-font tests for missing/corrupt caches, relocated installations,
+  incompatible versions, damaged assets, and real PNG/SVG/PDF rendering. A call
+  recorder asserts zero font-discovery calls during these tests and the actual
+  installed app smoke launch; this is independent of timing thresholds.
 
 The smoke-test TIFF directory is owned by the verifier and removed after the GUI
 child exits; Windows cannot delete an actively displayed memory-mapped image.

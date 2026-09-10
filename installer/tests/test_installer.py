@@ -34,6 +34,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("tifffile==2026.3.3", intel)
         self.assertIn("torch==2.13.0+cpu", build.requirements("win-64"))
         self.assertIn("torch==2.13.0", build.requirements("osx-arm64"))
+        self.assertTrue(all("matplotlib==3.11.1" in build.requirements(target) for target in build.PLATFORMS))
 
     def test_smoke_fixture_lives_until_child_exit_and_is_cleaned(self):
         observed = []
@@ -213,6 +214,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertTrue(Path(os.environ["MPLCONFIGDIR"]).is_dir())
                 self.assertTrue(Path(os.environ["NUMBA_CACHE_DIR"]).is_dir())
                 self.assertEqual(os.environ["NAPARI_CONFIG"], str(root / "settings/napari.yaml"))
+                self.assertEqual(os.environ["MPL_IGNORE_SYSTEM_FONTS"], "1")
 
 
 if __name__ == "__main__":
