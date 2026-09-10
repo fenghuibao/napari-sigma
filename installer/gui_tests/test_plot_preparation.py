@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from napari_sigma._launcher import _configure_pyqt6
 _configure_pyqt6()
@@ -29,23 +30,26 @@ class PlotPreparationTests(unittest.TestCase):
         self.addCleanup(panel.dispose)
         return viewer, panel
 
-    def process_until(self, condition, timeout=20):
+    def process_until(self, condition, timeout=20, diagnostics=None):
         end = time.monotonic() + timeout
         while not condition() and time.monotonic() < end:
             QApplication.processEvents()
             time.sleep(.01)
-        self.assertTrue(condition(), "Condition was not reached while processing Qt events")
+        if not condition():
+            details = diagnostics() if diagnostics is not None else ""
+            self.fail(f"Condition not reached after {timeout}s while processing Qt events. {details}")
 
     def test_pending_import_keeps_ui_responsive_and_creates_canvas_on_main_thread(self):
         release = threading.Event()
+        self.addCleanup(release.set)
         thread_ids = []
         def prepare():
             thread_ids.append(threading.get_ident())
-            if not release.wait(10):
-                raise RuntimeError("Test did not release background preparation")
+            # Cleanup always releases this daemon worker, including on failure.
+            # Slow panel construction must not accidentally open the test gate.
+            release.wait()
             desktop.prepare_plot_modules()
         preparation = desktop.PlotPreparation(prepare)
-        self.addCleanup(release.set)
         viewer, panel = self.make_panel(preparation)
         beats = []
         timer = QTimer(panel)
@@ -61,16 +65,28 @@ class PlotPreparationTests(unittest.TestCase):
         panel._panel_tabs.setCurrentWidget(panel._analysis_tab)
         self.assertIsNone(panel._analysis_plot_axes)
         release.set()
-        self.process_until(lambda: panel._analysis_plot_canvas is not None)
+        # Cold system font enumeration can exceed 20s on the Intel CI runner.
+        # This is a completion budget, not permission to block the GUI: the
+        # event-loop assertions above still run while preparation is gated.
+        self.process_until(
+            lambda: panel._analysis_plot_canvas is not None or preparation.error is not None,
+            timeout=180,
+            diagnostics=lambda: (
+                f"worker_done={preparation.done.is_set()}, error={preparation.error!r}, "
+                f"preparation_seconds={preparation.seconds}, Qt_ticks={len(beats)}, "
+                f"placeholder={panel._analysis_plot_placeholder.text()!r}"),
+        )
         self.assertIsNone(preparation.error)
+        self.assertIsNotNone(panel._analysis_plot_canvas)
         self.assertNotEqual(thread_ids[0], threading.get_ident())
         self.assertEqual(panel._analysis_plot_canvas.thread(), QApplication.instance().thread())
         self.assertFalse(panel._desktop_plot_timer.isActive())
+        print(f"Background plot preparation: {preparation.seconds:.3f}s; Qt ticks: {len(beats)}", flush=True)
 
     def test_close_while_preparing_does_not_wait_or_touch_deleted_widgets(self):
         release = threading.Event()
-        preparation = desktop.PlotPreparation(lambda: release.wait(10))
         self.addCleanup(release.set)
+        preparation = desktop.PlotPreparation(release.wait)
         viewer, panel = self.make_panel(preparation)
         panel.dispose()
         self.assertFalse(panel._desktop_plot_timer.isActive())
@@ -92,7 +108,13 @@ class PlotPreparationTests(unittest.TestCase):
         self.assertIsNone(panel._analysis_plot_canvas)
 
     def test_default_preparation_is_shared_between_panels(self):
-        self.assertIs(desktop.shared_preparation(), desktop.shared_preparation())
+        # Test singleton ownership without launching a second real importer
+        # that interferes with the separate cold-font integration test.
+        with patch.object(desktop, "_shared_preparation", None), \
+                patch.object(desktop, "PlotPreparation") as constructor:
+            self.assertIs(desktop.shared_preparation(), constructor.return_value)
+            self.assertIs(desktop.shared_preparation(), constructor.return_value)
+            constructor.assert_called_once_with()
 
 
 if __name__ == "__main__":
