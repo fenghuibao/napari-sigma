@@ -22,6 +22,14 @@ def menu_mode(prefix: Path) -> str:
     return "system" if os.geteuid() == 0 else "user"
 
 
+def pip_environment() -> dict[str, str]:
+    # User pip settings such as PIP_TARGET/PIP_PREFIX must never redirect writes
+    # out of the bundled runtime, nor enable an external package index.
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith("PIP_")}
+    env["PIP_CONFIG_FILE"] = os.devnull
+    return env
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--remove-shortcuts", action="store_true")
@@ -35,15 +43,16 @@ def main():
         remove(resources / "menu.json", target_prefix=str(prefix), base_prefix=str(prefix), _mode=mode)
         return
     log = resources / "installation.log"
+    env = pip_environment()
     with log.open("a", encoding="utf-8") as stream:
         subprocess.run([
-            sys.executable, "-I", "-m", "pip", "install", "--no-index",
+            sys.executable, "-I", "-m", "pip", "--isolated", "install", "--no-index",
             "--find-links", str(resources / "wheelhouse"), "--require-hashes", "--no-deps",
             "--no-cache-dir", "--no-compile", "--disable-pip-version-check", "--ignore-installed",
             "--root-user-action=ignore", "-r", str(resources / "requirements.lock"),
-        ], check=True, stdout=stream, stderr=subprocess.STDOUT)
-        subprocess.run([sys.executable, "-I", "-m", "pip", "check"],
-                       check=True, stdout=stream, stderr=subprocess.STDOUT)
+        ], check=True, stdout=stream, stderr=subprocess.STDOUT, env=env)
+        subprocess.run([sys.executable, "-I", "-m", "pip", "--isolated", "check"],
+                       check=True, stdout=stream, stderr=subprocess.STDOUT, env=env)
     bundle = json.loads((resources / "bundle.json").read_text(encoding="utf-8"))
     subprocess.run([sys.executable, "-I", "-c",
                     "import napari_sigma; assert napari_sigma.__version__ == " + repr(bundle["sigma_version"])], check=True)

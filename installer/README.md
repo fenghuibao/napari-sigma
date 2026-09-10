@@ -15,6 +15,9 @@ Intel uses the last available official Intel macOS Torch wheels. Windows CUDA an
 Windows ARM are not included. Separate backends are not promised bit-identical.
 The CI uses macOS 15 and Windows Server 2022; this is not a substitute for testing
 every supported consumer OS/hardware combination.
+Windows rendering requires a working OpenGL driver. The GitHub Windows VM uses
+a hash-pinned Mesa software driver installed **only on the disposable CI host**;
+this driver is not bundled with SIGMA and no end-user system driver is changed.
 
 ## Build
 
@@ -38,6 +41,12 @@ To intentionally update dependencies, build in a new work directory and re-test.
 The build runtime must remain conda-only until constructor has finished: do not
 install the wheelhouse into that environment manually. This keeps conda's package
 inventory complete. `--prepare-only` can be used to inspect payload/configuration.
+For launcher/configuration-only fixes, `--reuse-wheelhouse` reuses the previous
+hash-verified wheel set and puts constructor in offline mode. It requires the
+complete existing build/runtime/cache directories and refuses altered wheel files.
+Full builds also require the standalone conda executable to run successfully;
+restricted sandbox semaphore failures must be resolved on a normal build runner,
+not treated as a successful build. SHA-256 files accompany the generated installers.
 
 ## Verification and CI
 

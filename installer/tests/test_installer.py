@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import plistlib
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -41,6 +43,29 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(item["platforms"]["win"]["command"][:2], ["{{ PYTHONW }}", "-I"])
         self.assertEqual(item["platforms"]["osx"]["LSMinimumSystemVersion"], "14.0")
 
+    def test_macos_plist_does_not_duplicate_menuinst_properties(self):
+        from menuinst.platforms.base import menuitem_defaults
+        mac = build.menu_metadata("0.0.5")["menu_items"][0]["platforms"]["osx"]
+        self.assertFalse(set(mac.get("info_plist_extra", {})) & set(menuitem_defaults["platforms"]["osx"]))
+        self.assertEqual(mac["CFBundleDisplayName"], "SIGMA")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS bundle integration")
+    def test_macos_bundle_plist_is_actually_generated(self):
+        from menuinst.api import _load
+        from menuinst.platforms.osx import MacOSMenuItem
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, items = _load(build.menu_metadata("0.0.5"), str(root), str(root), "user")
+            item = items[0]
+            with patch.object(MacOSMenuItem, "_base_location", return_value=root):
+                item._create_application_tree()
+                item._write_plistinfo()
+                with (item.location / "Contents/Info.plist").open("rb") as stream:
+                    plist = plistlib.load(stream)
+                self.assertEqual(plist["CFBundleDisplayName"], "SIGMA")
+                self.assertEqual(plist["CFBundleIdentifier"], "org.fenghuibao.sigma.desktop")
+                self.assertEqual(plist["CFBundleVersion"], "0.0.5")
+
     def test_constructor_does_not_modify_shell_or_register_python(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -50,6 +75,7 @@ class InstallerTests(unittest.TestCase):
                 self.assertFalse(config["initialize_conda"])
                 self.assertFalse(config["register_envs"])
                 self.assertEqual(config["menu_packages"], [])
+                self.assertIn({"hash": {"algorithm": "sha256"}}, config["build_outputs"])
                 self.assertIn("unsigned", config["installer_filename"])
                 self.assertEqual(list(config["extra_files"][0].values()), ["sigma-desktop/payload.txt"] if os.name != "nt" else ["sigma-desktop\\payload.txt"])
                 if target == "win-64":
@@ -77,18 +103,45 @@ class InstallerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing"):
                 build.lock_wheels(root, root / "requirements.lock")
 
+    def test_cached_wheelhouse_requires_unchanged_hashes_and_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = root / "wheelhouse"
+            wheels.mkdir()
+            for name in ("napari_sigma", "torch"):
+                with zipfile.ZipFile(wheels / f"{name}-1-py3-none-any.whl", "w") as archive:
+                    archive.writestr(f"{name}-1.dist-info/METADATA", f"Name: {name}\nVersion: 1\n")
+            records = build.lock_wheels(wheels, root / "requirements.lock")
+            bundle = {"platform": "osx-arm64", "sigma_version": build.VERSION, "wheels": records}
+            (root / "bundle.json").write_text(json.dumps(bundle))
+            self.assertEqual(build.validated_cached_wheels(root, "osx-arm64"), records)
+            with self.assertRaisesRegex(ValueError, "different platform"):
+                build.validated_cached_wheels(root, "win-64")
+            with zipfile.ZipFile(wheels / "torch-1-py3-none-any.whl", "a") as archive:
+                archive.writestr("unexpected.txt", "modified")
+            with self.assertRaisesRegex(ValueError, "changed"):
+                build.validated_cached_wheels(root, "osx-arm64")
+
     def test_installer_cannot_modify_unrelated_python(self):
         with self.assertRaisesRegex(RuntimeError, "own bundled Python"):
             install.install_prefix()
 
+    def test_user_pip_configuration_cannot_redirect_install(self):
+        with patch.dict(os.environ, {"PIP_TARGET": "/outside", "PIP_PREFIX": "/outside", "PIP_CONFIG_FILE": "/user/pip.ini"}):
+            env = install.pip_environment()
+            self.assertNotIn("PIP_TARGET", env)
+            self.assertNotIn("PIP_PREFIX", env)
+            self.assertEqual(env["PIP_CONFIG_FILE"], os.devnull)
+
     def test_caches_are_per_user(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch.object(launch, "user_directories", return_value=(root / "logs", root / "cache")), patch.dict(os.environ, {}, clear=True):
+            with patch.object(launch, "user_directories", return_value=(root / "logs", root / "cache")), patch.object(launch, "user_configuration", return_value=root / "settings"), patch.dict(os.environ, {}, clear=True):
                 log = launch.prepare_process()
                 self.assertEqual(log, root / "logs/desktop.log")
                 self.assertTrue(Path(os.environ["MPLCONFIGDIR"]).is_dir())
                 self.assertTrue(Path(os.environ["NUMBA_CACHE_DIR"]).is_dir())
+                self.assertEqual(os.environ["NAPARI_CONFIG"], str(root / "settings/napari.yaml"))
 
 
 if __name__ == "__main__":

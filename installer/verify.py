@@ -22,7 +22,10 @@ def main():
     env = os.environ.copy()
     env.update(NUMBA_CACHE_DIR=str(output / "numba-cache"), MPLCONFIGDIR=str(output / "mpl-cache"), PYTHONWARNINGS="ignore")
     # A poisoned PYTHONPATH must not affect the -I entry point.
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    poison = output / "poison-path"
+    poison.mkdir(exist_ok=True)
+    (poison / "napari_sigma.py").write_text("raise RuntimeError('External PYTHONPATH was loaded')\n", encoding="utf-8")
+    env["PYTHONPATH"] = str(poison)
     commands = [
         [python, "-I", "-c", "import sys, pathlib, napari_sigma; p=pathlib.Path(napari_sigma.__file__).resolve(); assert p.is_relative_to(pathlib.Path(sys.prefix).resolve()), p; print(p)"],
         [python, "-I", "-m", "pip", "check"],
@@ -32,6 +35,10 @@ def main():
     for index, command in enumerate(commands):
         command = [str(arg) for arg in command]
         print(subprocess.list2cmdline(command), flush=True)
+        # The existing tests also create non-isolated child interpreters. Keep
+        # those children pointed at the installed core, never the checkout.
+        if index == 3:
+            env.pop("PYTHONPATH", None)
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=1200)
         (output / f"check-{index}.log").write_bytes(result.stdout)
         print(result.stdout.decode("utf-8", errors="replace"), flush=True)

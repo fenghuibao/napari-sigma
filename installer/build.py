@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 import yaml
@@ -82,6 +83,19 @@ def lock_wheels(wheelhouse: Path, destination: Path) -> list[dict]:
     return records
 
 
+def validated_cached_wheels(payload: Path, target: str) -> list[dict]:
+    """Reuse only the exact previously resolved wheel set, with no downloads."""
+    bundle = json.loads((payload / "bundle.json").read_text(encoding="utf-8"))
+    if bundle["platform"] != target or bundle["sigma_version"] != VERSION:
+        raise ValueError("Cached bundle is for a different platform or SIGMA version")
+    with tempfile.TemporaryDirectory() as directory:
+        lock = Path(directory) / "requirements.lock"
+        records = lock_wheels(payload / "wheelhouse", lock)
+        if records != bundle["wheels"] or lock.read_bytes() != (payload / "requirements.lock").read_bytes():
+            raise ValueError("Cached wheels or hash lock changed; use a fresh build directory")
+    return records
+
+
 def menu_metadata(version: str) -> dict:
     return {
         "$schema": "https://schemas.conda.org/menuinst-1-1-3.schema.json",
@@ -93,9 +107,9 @@ def menu_metadata(version: str) -> dict:
             "activate": False, "terminal": False,
             "platforms": {
                 "osx": {"CFBundleVersion": version,
-                        "LSMinimumSystemVersion": "14.0",
-                        "info_plist_extra": {"CFBundleIdentifier": "org.fenghuibao.sigma.desktop",
-                                             "CFBundleDisplayName": "SIGMA"}},
+                        "CFBundleDisplayName": "SIGMA",
+                        "CFBundleIdentifier": "org.fenghuibao.sigma.desktop",
+                        "LSMinimumSystemVersion": "14.0"},
                 "win": {"command": ["{{ PYTHONW }}", "-I", "{{ PREFIX }}/sigma-desktop/launch.py"],
                         "desktop": True, "app_user_model_id": "SIGMA.Desktop"},
             },
@@ -123,7 +137,8 @@ def constructor_config(target: str, runtime: Path, payload: Path) -> dict:
         "environment": str(runtime), "channels": ["conda-forge"],
         "license_file": str(HERE / "NOTICE.txt"),
         "initialize_conda": False, "register_envs": False, "menu_packages": [],
-        "keep_pkgs": False, "build_outputs": ["hash", "info.json", "pkgs_list"],
+        "keep_pkgs": False,
+        "build_outputs": [{"hash": {"algorithm": "sha256"}}, "info.json", "pkgs_list"],
         "extra_files": [{str(path): str(Path("sigma-desktop") / path.relative_to(payload))}
                         for path in sorted(payload.rglob("*")) if path.is_file()],
         "post_install": str(HERE / ("post_install.bat" if target == "win-64" else "post_install.sh")),
@@ -160,11 +175,19 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--conda", default=shutil.which("conda"))
     parser.add_argument("--constructor", default=shutil.which("constructor"))
+    parser.add_argument("--standalone-conda", type=Path,
+                        default=Path(sys.prefix) / "standalone_conda/conda.exe")
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--reuse-wheelhouse", action="store_true",
+                        help="Rebuild with the previously locked dependencies; require a complete local cache")
     args = parser.parse_args()
     target = native_platform()
     if not args.conda or not args.constructor:
         parser.error("conda and constructor are required in the build environment")
+    if not args.prepare_only:
+        # Constructor can otherwise fall back after a failed executable probe
+        # and still emit an installer with incorrectly detected capabilities.
+        run([args.standalone_conda, "--version"])
     work = args.work_dir.resolve()
     output = args.output_dir.resolve()
     runtime = work / "runtime"
@@ -173,6 +196,8 @@ def main():
     for path in (work, output, wheels):
         path.mkdir(parents=True, exist_ok=True)
     if not (runtime / "conda-meta" / "history").is_file():
+        if args.reuse_wheelhouse:
+            parser.error("--reuse-wheelhouse requires an existing runtime and payload")
         python_version = "3.11" if target == "osx-64" else "3.13"
         run([args.conda, "create", "--prefix", runtime, "--override-channels", "-c", "conda-forge",
              "--no-default-packages", f"python={python_version}", "pip", "menuinst=2.5.2", "--yes", "--quiet"])
@@ -184,10 +209,13 @@ def main():
     if target.startswith("osx-"):
         # Building on a newer Mac must not silently select macOS 15+ wheels.
         download += ["--platform", "macosx_14_0_" + ("arm64" if target == "osx-arm64" else "x86_64")]
-    if target == "win-64":
-        run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
-    run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requirements(target))
-    records = lock_wheels(wheels, payload / "requirements.lock")
+    if args.reuse_wheelhouse:
+        records = validated_cached_wheels(payload, target)
+    else:
+        if target == "win-64":
+            run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
+        run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requirements(target))
+        records = lock_wheels(wheels, payload / "requirements.lock")
     for name in ("launch.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
         shutil.copy2(HERE / name, payload / name)
     shutil.copy2(HERE.parent / "LICENSE", payload / "SIGMA-LICENSE.txt")
@@ -204,7 +232,11 @@ def main():
     shutil.copy2(payload / "bundle.json", output / f"bundle-{target}.json")
     shutil.copy2(HERE / "QUICKSTART.txt", output / "QUICKSTART.txt")
     if not args.prepare_only:
-        run([args.constructor, "--output-dir", output, "--cache-dir", work / "constructor-cache", work])
+        env = os.environ.copy()
+        if args.reuse_wheelhouse:
+            env["CONDA_OFFLINE"] = "true"
+        run([args.constructor, "--conda-exe", args.standalone_conda,
+             "--output-dir", output, "--cache-dir", work / "constructor-cache", work], env=env)
     print(f"Bundle prepared for {target}: {output}", flush=True)
 
 

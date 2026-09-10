@@ -47,7 +47,7 @@ jobs:
         run: python installer/build.py --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
       - name: Install macOS package in disposable runner
         if: runner.os == 'macOS'
-        run: sudo installer -pkg dist-desktop/*.pkg -target /
+        run: sudo installer -pkg dist-desktop/*.pkg -target / -dumplog
       - name: Verify installed macOS application and core regressions
         if: runner.os == 'macOS'
         run: python installer/verify.py --prefix /Library/sigma-0.0.5 --output-dir dist-desktop/verification
@@ -60,8 +60,14 @@ jobs:
           $proc = Start-Process -FilePath $package -ArgumentList "/S /InstallationType=JustMe /AddToPath=0 /RegisterPython=0 /D=$prefix" -Wait -PassThru
           if ($proc.ExitCode -ne 0) { throw "Installer failed with exit code $($proc.ExitCode)" }
           "SIGMA_TEST_PREFIX=$prefix" >> $env:GITHUB_ENV
+      - name: Prepare Windows runner OpenGL display
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./installer/ci_windows_graphics.ps1
       - name: Verify installed Windows application and core regressions
         if: runner.os == 'Windows'
+        # No driver or rendering shim is added to the distributable application.
+        # The preceding step prepares only the disposable runner's display.
         run: python installer/verify.py --prefix "$SIGMA_TEST_PREFIX" --output-dir dist-desktop/verification
       - name: Test Windows uninstaller
         if: runner.os == 'Windows'
@@ -74,6 +80,23 @@ jobs:
           $record = Get-Content dist-desktop/verification/verification.json | ConvertFrom-Json
           foreach ($shortcut in $record.shortcuts.paths) {
             if (Test-Path $shortcut) { throw "Shortcut remains after uninstall: $shortcut" }
+          }
+      - name: Collect macOS installation diagnostics
+        if: always() && runner.os == 'macOS'
+        run: |
+          mkdir -p dist-desktop/diagnostics
+          sudo tail -n 500 /var/log/install.log > dist-desktop/diagnostics/installer.log
+          if [ -f /Library/sigma-0.0.5/sigma-desktop/installation.log ]; then
+            sudo cp /Library/sigma-0.0.5/sigma-desktop/installation.log dist-desktop/diagnostics/pip-installation.log
+          fi
+      - name: Collect Windows installation diagnostics
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-desktop/diagnostics | Out-Null
+          $log = "$env:SIGMA_TEST_PREFIX\sigma-desktop\installation.log"
+          if ($env:SIGMA_TEST_PREFIX -and (Test-Path $log)) {
+            Copy-Item $log dist-desktop/diagnostics/pip-installation.log
           }
       - uses: actions/upload-artifact@v4
         if: always()

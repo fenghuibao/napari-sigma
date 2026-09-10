@@ -19,14 +19,22 @@ def user_directories() -> tuple[Path, Path]:
     return local / "logs", local / "cache"
 
 
+def user_configuration() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/SIGMA"
+    return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "SIGMA"
+
+
 def prepare_process() -> Path:
     # Shortcuts use -I too, so inherited PYTHONPATH/user-site packages cannot
     # contaminate this installation. Keep all caches outside the private runtime.
     logs, cache = user_directories()
-    for directory in (logs, cache / "numba", cache / "matplotlib"):
+    configuration = user_configuration()
+    for directory in (logs, cache / "numba", cache / "matplotlib", configuration):
         directory.mkdir(parents=True, exist_ok=True)
     os.environ["NUMBA_CACHE_DIR"] = str(cache / "numba")
     os.environ["MPLCONFIGDIR"] = str(cache / "matplotlib")
+    os.environ["NAPARI_CONFIG"] = str(configuration / "napari.yaml")
     return logs / "desktop.log"
 
 
@@ -49,7 +57,9 @@ def smoke_checks(viewer, panel) -> dict:
     response = raw.astype(np.float32) / 255
     result, _ = segmentation(raw, response, pixel_size=(.1, .1), beta1=.5, beta2=1.,
                              n_fore=1, n_back=1, max_iter=2, init_method="otsu")
-    assert result.shape == raw.shape
+    # Core segmentation retains a leading singleton axis for 2-D input.
+    assert result.shape == (1, *raw.shape)
+    assert result.dtype == np.uint8 and np.isin(result, (0, 255)).all()
     model = FrangiFilter(1, 5, [1.], 2, psf_ratio=1.)
     filtered = model(-torch.from_numpy(raw.astype(np.float32))[None, None])
     assert bool(torch.isfinite(filtered).all())
@@ -100,9 +110,13 @@ def main(argv=None) -> int:
             raise RuntimeError("SIGMA installation version mismatch. Reinstall the complete desktop package.")
         viewer = napari.Viewer(title=f"SIGMA {napari_sigma.__version__}", show=False)
         panel = SIGMAWidget(viewer)
-        viewer.window.add_dock_widget(panel, name="SIGMA")
+        dock = viewer.window.add_dock_widget(panel, name="SIGMA")
         panel.device_combo.setCurrentText(bundle["default_device"])
         viewer.show()
+        # The scientific panel has a substantial minimum width. A small default
+        # napari window can otherwise leave no visible image canvas.
+        viewer.window._qt_window.showMaximized()
+        viewer.window._qt_window.resizeDocks([dock], [panel.minimumWidth()], Qt.Horizontal)
         splash.finish(viewer.window._qt_window)
         app.processEvents()
         if args.smoke_test:
