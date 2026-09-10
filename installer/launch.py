@@ -90,22 +90,30 @@ def main(argv=None) -> int:
         from napari_sigma._launcher import _configure_pyqt6
         _configure_pyqt6()
         from qtpy.QtCore import Qt
-        from qtpy.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
+        from qtpy.QtGui import QIcon, QPixmap, QPainter, QColor
         from qtpy.QtWidgets import QApplication, QSplashScreen
         app = QApplication.instance() or QApplication(["SIGMA"])
         app.setApplicationName("SIGMA")
-        app.setWindowIcon(QIcon(str(RESOURCES / "sigma.png")))
-        pixmap = QPixmap(480, 170)
-        pixmap.fill(QColor("#182838"))
+        app.setApplicationDisplayName("SIGMA")
+        icon = QIcon(str(RESOURCES / "sigma.png"))
+        if icon.isNull():
+            raise RuntimeError("The SIGMA app icon is missing or invalid")
+        app.setWindowIcon(icon)
+        pixmap = QPixmap(420, 440)
+        pixmap.fill(QColor("white"))
+        logo = QPixmap(str(RESOURCES / "sigma.png")).scaled(
+            380, 380, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         painter = QPainter(pixmap)
-        painter.setPen(QColor("#72e0bd"))
-        painter.setFont(QFont("Arial", 28, QFont.Bold))
-        painter.drawText(pixmap.rect(), Qt.AlignCenter, "SIGMA")
+        painter.drawPixmap((pixmap.width() - logo.width()) // 2, 10, logo)
         painter.end()
         splash = QSplashScreen(pixmap)
-        splash.showMessage("Loading microscopy tools…", Qt.AlignBottom | Qt.AlignHCenter, QColor("white"))
+        splash.setWindowTitle("SIGMA")
+        splash.showMessage("Loading microscopy tools…", Qt.AlignBottom | Qt.AlignHCenter, QColor("#082b50"))
         splash.show()
         app.processEvents()
+        if args.smoke_test and args.screenshot:
+            if not splash.grab().save(str(args.screenshot.with_name("splash.png"))):
+                raise RuntimeError("Could not save startup-screen screenshot")
 
         import napari
         import napari_sigma
@@ -113,7 +121,14 @@ def main(argv=None) -> int:
         bundle = json.loads((RESOURCES / "bundle.json").read_text(encoding="utf-8"))
         if napari_sigma.__version__ != bundle["sigma_version"]:
             raise RuntimeError("SIGMA installation version mismatch. Reinstall the complete desktop package.")
-        viewer = napari.Viewer(title=f"SIGMA {napari_sigma.__version__}", show=False)
+        viewer = napari.Viewer(title="SIGMA", show=False)
+        # napari sets its own application icon during window creation/theme
+        # changes. Restore SIGMA branding, including an explicit window icon.
+        def restore_icon(*_):
+            app.setWindowIcon(icon)
+            viewer.window._qt_window.setWindowIcon(icon)
+        viewer.events.theme.connect(restore_icon)
+        restore_icon()
         panel = SIGMAWidget(viewer)
         dock = viewer.window.add_dock_widget(panel, name="SIGMA")
         panel.device_combo.setCurrentText(bundle["default_device"])
@@ -132,6 +147,10 @@ def main(argv=None) -> int:
         splash.finish(viewer.window._qt_window)
         app.processEvents()
         if args.smoke_test:
+            if app.applicationDisplayName() != "SIGMA" or viewer.window._qt_window.windowTitle() != "SIGMA":
+                raise RuntimeError("Application/window name must be SIGMA without a version suffix")
+            if viewer.window._qt_window.windowIcon().cacheKey() != icon.cacheKey():
+                raise RuntimeError("SIGMA window icon was replaced")
             print(json.dumps(smoke_checks(viewer, panel, args.smoke_data_dir)), flush=True)
             app.processEvents()
             canvas = viewer.window._qt_viewer.canvas.native

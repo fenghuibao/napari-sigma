@@ -103,13 +103,14 @@ def menu_metadata(version: str) -> dict:
         "$schema": "https://schemas.conda.org/menuinst-1-1-3.schema.json",
         "menu_name": "SIGMA",
         "menu_items": [{
-            "name": f"SIGMA {version}", "description": "Microscopy segmentation and analysis",
+            "name": "SIGMA", "description": "Microscopy segmentation and analysis",
             "command": ["{{ PYTHON }}", "-I", "{{ PREFIX }}/sigma-desktop/launch.py"],
             "icon": "{{ PREFIX }}/sigma-desktop/sigma.{{ ICON_EXT }}",
             "activate": False, "terminal": False,
             "platforms": {
                 "osx": {"CFBundleVersion": version,
                         "CFBundleDisplayName": "SIGMA",
+                        "CFBundleName": "SIGMA",
                         "CFBundleIdentifier": "org.fenghuibao.sigma.desktop",
                         "LSMinimumSystemVersion": "14.0"},
                 "win": {"command": ["{{ PYTHONW }}", "-I", "{{ PREFIX }}/sigma-desktop/launch.py"],
@@ -120,15 +121,14 @@ def menu_metadata(version: str) -> dict:
 
 
 def make_icons(destination: Path):
-    """Rasterize the simple, code-defined sigma app mark into OS icon formats."""
-    from PIL import Image, ImageDraw
-    image = Image.new("RGBA", (1024, 1024))
-    draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((32, 32, 992, 992), radius=210, fill="#182838")
-    draw.polygon([(280, 235), (775, 235), (775, 350), (455, 350), (630, 505),
-                  (455, 675), (775, 675), (775, 790), (280, 790), (280, 690),
-                  (480, 510), (280, 330)], fill="#72e0bd")
-    image.save(destination / "sigma.png")
+    """Package the supplied artwork unchanged; resize only for native formats."""
+    from PIL import Image
+    source = HERE / "assets/sigma-logo.png"
+    with Image.open(source) as original:
+        if original.width != original.height or original.width < 1024:
+            raise ValueError("The app logo must be square and at least 1024 pixels wide")
+        image = original.convert("RGBA").resize((1024, 1024), Image.Resampling.LANCZOS)
+    shutil.copy2(source, destination / "sigma.png")
     image.save(destination / "sigma.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)])
     image.save(destination / "sigma.icns")
 
@@ -152,7 +152,7 @@ def constructor_config(target: str, runtime: Path, payload: Path) -> dict:
             default_prefix_domain_user=f"%LOCALAPPDATA%\\SIGMA\\{VERSION}",
             default_prefix_all_users=f"%ALLUSERSPROFILE%\\SIGMA\\{VERSION}",
             register_python=False, check_path_spaces=False,
-            uninstall_name=f"SIGMA {VERSION}", pre_uninstall=str(HERE / "pre_uninstall.bat"),
+            uninstall_name="SIGMA", pre_uninstall=str(HERE / "pre_uninstall.bat"),
             welcome_image_text="SIGMA", header_image_text="SIGMA",
             icon_image=str(payload / "sigma.ico"),
             conclusion_text="SIGMA is installed.\nOpen SIGMA from the Start menu or desktop.",
@@ -226,6 +226,7 @@ def main():
     (payload / "bundle.json").write_text(json.dumps({
         "schema": 1, "sigma_version": VERSION, "platform": target,
         "default_device": "auto" if target == "osx-arm64" else "cpu",
+        "branding": {"name": "SIGMA", "logo_sha256": hashlib.sha256((payload / "sigma.png").read_bytes()).hexdigest()},
         "signed": False, "wheels": records,
     }, indent=2), encoding="utf-8")
     (work / "construct.yaml").write_text(yaml.safe_dump(

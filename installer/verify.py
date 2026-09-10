@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,11 @@ def main():
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     resources = prefix / "sigma-desktop"
+    bundle = json.loads((resources / "bundle.json").read_text(encoding="utf-8"))
+    source_logo = Path(__file__).resolve().parent / "assets/sigma-logo.png"
+    if (resources / "sigma.png").read_bytes() != source_logo.read_bytes():
+        raise RuntimeError("Installed logo differs from the supplied artwork")
+    assert bundle["branding"]["logo_sha256"] == hashlib.sha256(source_logo.read_bytes()).hexdigest()
     python = prefix / ("python.exe" if sys.platform == "win32" else "bin/python")
     env = os.environ.copy()
     env.update(NUMBA_CACHE_DIR=str(output / "numba-cache"), MPLCONFIGDIR=str(output / "mpl-cache"), PYTHONWARNINGS="ignore")
@@ -63,9 +70,23 @@ def main():
     for path in shortcuts["paths"]:
         if not Path(path).exists():
             raise RuntimeError(f"Missing installed shortcut: {path}")
+    if sys.platform == "darwin":
+        apps = [Path(path) for path in shortcuts["paths"] if path.endswith(".app")]
+        if len(apps) != 1 or apps[0].name != "SIGMA.app":
+            raise RuntimeError(f"Expected an unversioned SIGMA.app: {apps}")
+        with (apps[0] / "Contents/Info.plist").open("rb") as stream:
+            plist = plistlib.load(stream)
+        assert plist["CFBundleDisplayName"] == "SIGMA"
+        assert plist["CFBundleName"] == "SIGMA"
+        installed_icon = apps[0] / "Contents/Resources" / plist["CFBundleIconFile"]
+        assert installed_icon.read_bytes() == (resources / "sigma.icns").read_bytes()
+    elif sys.platform == "win32":
+        links = [Path(path) for path in shortcuts["paths"] if path.endswith(".lnk")]
+        if not links or any(path.name != "SIGMA.lnk" for path in links):
+            raise RuntimeError(f"Expected unversioned SIGMA shortcuts: {links}")
     (output / "verification.json").write_text(json.dumps({
         "status": "passed", "prefix": str(prefix), "shortcuts": shortcuts,
-        "bundle": json.loads((resources / "bundle.json").read_text(encoding="utf-8")),
+        "bundle": bundle,
     }, indent=2), encoding="utf-8")
 
 

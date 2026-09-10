@@ -5,6 +5,12 @@ The desktop launcher opens napari and the SIGMA panel automatically. No terminal
 Python installation, shell initialization, or administrator rights are needed for
 a per-user installation. macOS also offers installation for all users.
 
+Application and shortcut names are always **SIGMA**, without a version suffix.
+Internal bundle metadata, private runtime paths and installer filenames retain
+the core version for compatibility checks and diagnosis. The user-supplied
+`assets/sigma-logo.png` is copied unchanged to the runtime and only resized when
+encoding ICO/ICNS. The same artwork appears on the startup screen and Qt windows.
+
 | Target | Runtime | Compute default | Minimum OS |
 | --- | --- | --- | --- |
 | Apple Silicon | Python 3.13, Torch 2.13, NumPy 2.5 | auto (MPS/CPU) | macOS 14 |
@@ -61,7 +67,7 @@ targets, installs the actual generated installer in a disposable runner, and run
 - calibrated uint64 TIFF round trip through napari's reader protocol;
 - CPU Frangi and segmentation smoke tests;
 - the existing core regression suite against the **installed wheel**, not `src/`;
-- shortcut existence and Windows uninstallation checks.
+- shortcut existence/names, installed artwork, native icon and Windows uninstallation checks.
 
 The smoke-test TIFF directory is owned by the verifier and removed after the GUI
 child exits; Windows cannot delete an actively displayed memory-mapped image.
@@ -84,5 +90,7 @@ Neither secrets nor signing workarounds are embedded in this repository.
 
 Third-party components retain their own licenses in the installation and wheel
 archives. Review applicable redistribution requirements before public distribution.
-The included user guide describes supported platforms, logs, uninstalling, and
-side-by-side upgrades. Core Python-package publishing is independent of this build.
+The included user guide describes supported platforms, logs and uninstalling.
+Close/uninstall an older desktop build before replacement: the stable SIGMA app
+name is shared across versions, so side-by-side shortcuts are no longer supported.
+Core Python-package publishing is independent of this build.

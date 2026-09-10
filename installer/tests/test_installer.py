@@ -84,6 +84,7 @@ class InstallerTests(unittest.TestCase):
         menu = build.menu_metadata("0.0.5")
         json.dumps(menu)
         item = menu["menu_items"][0]
+        self.assertEqual(item["name"], "SIGMA")
         self.assertFalse(item["activate"])
         self.assertFalse(item["terminal"])
         self.assertEqual(item["command"][:2], ["{{ PYTHON }}", "-I"])
@@ -110,6 +111,8 @@ class InstallerTests(unittest.TestCase):
                 with (item.location / "Contents/Info.plist").open("rb") as stream:
                     plist = plistlib.load(stream)
                 self.assertEqual(plist["CFBundleDisplayName"], "SIGMA")
+                self.assertEqual(plist["CFBundleName"], "SIGMA")
+                self.assertEqual(item.location.name, "SIGMA.app")
                 self.assertEqual(plist["CFBundleIdentifier"], "org.fenghuibao.sigma.desktop")
                 self.assertEqual(plist["CFBundleVersion"], "0.0.5")
 
@@ -127,8 +130,25 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(list(config["extra_files"][0].values()), ["sigma-desktop/payload.txt"] if os.name != "nt" else ["sigma-desktop\\payload.txt"])
                 if target == "win-64":
                     self.assertFalse(config["register_python"])
+                    self.assertEqual(config["uninstall_name"], "SIGMA")
                 else:
                     self.assertEqual(config["pkg_name"], "sigma-0.0.5")
+
+    def test_icons_use_supplied_artwork_in_all_native_formats(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            build.make_icons(destination)
+            source = ROOT / "assets/sigma-logo.png"
+            self.assertEqual((destination / "sigma.png").read_bytes(), source.read_bytes())
+            with Image.open(source) as original:
+                expected = original.convert("RGBA").resize((1024, 1024), Image.Resampling.LANCZOS)
+            with Image.open(destination / "sigma.icns") as mac:
+                mac.size = (1024, 1024)
+                self.assertEqual(mac.convert("RGBA").tobytes(), expected.tobytes())
+            with Image.open(destination / "sigma.ico") as win:
+                self.assertEqual(win.ico.sizes(), {(16, 16), (32, 32), (48, 48), (64, 64), (256, 256)})
+                self.assertEqual(win.convert("RGBA").tobytes(), expected.resize((256, 256), Image.Resampling.LANCZOS).tobytes())
 
     def test_hash_lock_includes_every_wheel(self):
         with tempfile.TemporaryDirectory() as directory:

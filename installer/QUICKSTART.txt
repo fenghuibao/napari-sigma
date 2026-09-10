@@ -1,4 +1,4 @@
-SIGMA Desktop 0.0.5 - test installers
+SIGMA Desktop - test installers
 
 CHOOSE YOUR DOWNLOAD
 - macOS AppleSilicon: M-series Macs, macOS 14 or later; CPU/MPS.
@@ -9,7 +9,7 @@ CHOOSE YOUR DOWNLOAD
 INSTALL AND OPEN
 1. Double-click the PKG (Mac) or EXE (Windows) installer.
 2. Follow the installer. Installing the private runtime may take several minutes.
-3. Open "SIGMA 0.0.5" from Applications (Mac) or Start/Desktop (Windows).
+3. Open "SIGMA" from Applications (Mac) or Start/Desktop (Windows).
 4. The SIGMA panel opens automatically. Use Open File or drag a TIFF into napari.
 5. Check channel, time, Z and physical pixel sizes before analysis.
 
@@ -29,11 +29,13 @@ LOGS
 Startup failures show a dialog with details and the log location.
 
 UNINSTALL
-- Windows: Settings > Apps > Installed apps > SIGMA 0.0.5 > Uninstall.
+- Windows: Settings > Apps > Installed apps > SIGMA > Uninstall.
 - Mac: close SIGMA; remove its application shortcut and its private runtime
   (~/Library/sigma-0.0.5 for a user install, /Library/sigma-0.0.5 for a system
   install). Do not delete your image or result folders.
 
 UPDATES
-Install a newer version side-by-side and verify it before removing the old one.
+Close SIGMA and uninstall an older desktop build before installing its replacement.
+Older test builds used the application name "SIGMA 0.0.5"; remove that shortcut too.
+The app/shortcut name is now always SIGMA; internal version metadata is retained.
 Do not update individual Python packages inside this tested desktop runtime.
