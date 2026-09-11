@@ -3,9 +3,9 @@
 This is the single version source used by both the package and setuptools.
 """
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 version = __version__
-__version_tuple__ = (0, 0, 5)
+__version_tuple__ = (0, 0, 6)
 version_tuple = __version_tuple__
 __commit_id__ = None
 commit_id = None

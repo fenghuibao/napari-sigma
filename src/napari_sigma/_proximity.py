@@ -9,6 +9,7 @@ from skimage.draw import polygon
 from ._layer_candidates import is_binary_mask_data
 from ._geometry import exposed_face_measure
 from ._metadata import (
+    is_analysis_aux_metadata,
     layer_dims_tag as _layer_dims_tag,
     squeeze_leading_singletons as _squeeze_leading_singletons,
 )
@@ -506,7 +507,7 @@ def is_proximity_segmentation_candidate_layer(layer) -> bool:
     md = getattr(layer, "metadata", {}) or {}
     if _is_proximity_aux_layer_metadata(md):
         return False
-    if md.get("is_analysis_labels") or md.get("is_analysis_highlight") or md.get("is_analysis_topology"):
+    if is_analysis_aux_metadata(md):
         return False
     data = getattr(layer, "data", None)
     if data is None or int(getattr(data, "size", 0)) == 0:
@@ -533,7 +534,7 @@ def is_proximity_raw_candidate_layer(layer) -> bool:
     md = getattr(layer, "metadata", {}) or {}
     if _is_proximity_aux_layer_metadata(md):
         return False
-    if md.get("is_analysis_labels") or md.get("is_analysis_highlight") or md.get("is_analysis_topology"):
+    if is_analysis_aux_metadata(md):
         return False
     if md.get("is_segmentation") or md.get("is_tracking"):
         return False
@@ -645,7 +646,11 @@ def _selection_physical_measure(
 def _distance_stats(distance_map: np.ndarray, basis_mask: np.ndarray) -> tuple[float, float]:
     values = np.asarray(distance_map, dtype=float)[np.asarray(basis_mask, dtype=bool)]
     if values.size == 0:
-        return 0.0, 0.0
+        # No voxels to measure from is "undefined", not "touching". Returning
+        # 0.0 here made an empty ROI read as perfect contact in the exported
+        # summary, indistinguishable from a real zero distance. The
+        # all-non-finite case below already reports nan; match it.
+        return float("nan"), float("nan")
     values = values[np.isfinite(values)]
     if values.size == 0:
         return float("nan"), float("nan")

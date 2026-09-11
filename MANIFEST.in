@@ -1,5 +1,7 @@
 include LICENSE
 include README.md
 include CHANGELOG.md
-recursive-include docs *.md *.png *.jpg *.jpeg
+recursive-include tests *.py
+prune docs
+prune installer
 prune example

@@ -39,7 +39,6 @@ from skimage.graph import MCP
 from skimage.measure import (
     find_contours,
     label,
-    perimeter,
     regionprops,
 )
 from skimage.morphology import skeletonize
@@ -48,6 +47,8 @@ from ._layer_candidates import limited_unique_values
 from ._tracking import _label_frame
 from ._geometry import exposed_face_measure
 from ._metadata import (
+    is_analysis_aux_metadata,
+    measurement_unit_for_layer,
     layer_dims_tag as _layer_dims_tag,
     squeeze_leading_singletons as _squeeze_leading_singletons,
     unit_from_metadata,
@@ -71,13 +72,92 @@ def _get_group_id(layer) -> str | None:
     return None
 
 
-def _is_analysis_aux_layer(layer) -> bool:
-    md = getattr(layer, "metadata", {}) or {}
-    return bool(
-        md.get("is_analysis_labels")
-        or md.get("is_analysis_highlight")
-        or md.get("is_analysis_topology")
+# One filter string for all three table exports.
+_TABLE_EXPORT_FILTER = "CSV (*.csv);;Text (*.txt);;Excel Workbook (*.xlsx)"
+
+# Column order and header text for every analysis table and export. Single
+# definition: the GUI tables and the multi-frame export used to carry their own
+# copies, which had drifted — the export dropped "label" entirely and emitted
+# "surface_area"/"perimeter" with no unit while the GUI wrote
+# "surface area (um^2)", so two CSVs from the same button would not join.
+ANALYSIS_PREFERRED_COLUMNS = (
+    "label",
+    "frame",
+    "object_label",
+    "branch_index",
+    "branch_length",
+    "pixels",
+    "voxels",
+    "perimeter",
+    "area",
+    "surface_area",
+    "volume",
+    "branch_number",
+    "junction_number",
+    "endpoint_number",
+    "total_branch_length",
+    "mean_branch_length",
+    "length source",
+)
+# Header text that does not depend on the unit.
+_ANALYSIS_PLAIN_LABELS = {
+    "label": "object label",
+    "object_label": "object label",
+    "frame": "frame",
+    "branch_index": "branch",
+    "pixels": "pixels (count)",
+    "voxels": "voxels (count)",
+    "branch_number": "branch number",
+    "junction_number": "junction number",
+    "endpoint_number": "endpoint number",
+    "length source": "length source",
+}
+# Header text templates for the unit-bearing quantities.
+_ANALYSIS_UNIT_LABELS = {
+    "branch_length": "branch length ({unit})",
+    "perimeter": "perimeter ({unit})",
+    "area": "area ({unit}^2)",
+    "surface_area": "surface area ({unit}^2)",
+    "volume": "volume ({unit}^3)",
+    "total_branch_length": "total branch length ({unit})",
+    "mean_branch_length": "mean branch length ({unit})",
+}
+
+
+def analysis_columns(row: dict[str, float | int] | None) -> list[str]:
+    """Ordered, exportable column names for one analysis row.
+
+    Keys beginning with "_" are internal (e.g. _object_branch_index) and are
+    never exported.
+    """
+    if not row:
+        return []
+    columns = [
+        column for column in ANALYSIS_PREFERRED_COLUMNS
+        if column in row and not str(column).startswith("_")
+    ]
+    columns.extend(
+        column for column in row
+        if column not in columns and not str(column).startswith("_")
     )
+    return columns
+
+
+def analysis_column_labels(row: dict[str, float | int] | None, unit: str) -> list[str]:
+    """Header text for `analysis_columns(row)`, stating `unit` where relevant."""
+    labels: list[str] = []
+    for column in analysis_columns(row):
+        if column in _ANALYSIS_PLAIN_LABELS:
+            labels.append(_ANALYSIS_PLAIN_LABELS[column])
+        elif column in _ANALYSIS_UNIT_LABELS:
+            labels.append(_ANALYSIS_UNIT_LABELS[column].format(unit=unit))
+        else:
+            labels.append(str(column))
+    return labels
+
+
+def _is_analysis_aux_layer(layer) -> bool:
+    return is_analysis_aux_metadata(getattr(layer, "metadata", {}))
 
 
 def _component_mask_from_layer(layer, frame_index: int | None = None) -> np.ndarray:
@@ -354,23 +434,49 @@ def _make_table_item(value: float | int) -> "QTableWidgetItem":
 
 
 def _spatial_scale_for_ndim(layer, ndim: int) -> tuple[float, ...] | None:
+    """Per-axis scale for a new layer of rank ``ndim``, taken from ``layer``.
+
+    As with the units above, ``None`` leaves the new layer on napari's default
+    of 1.0 per axis, which puts an overlay at the wrong world size next to its
+    calibrated source. A rank the reference does not cover is therefore
+    widened with 1.0 on the extra leading axes — the correct step for a time or
+    channel axis, which is indexed rather than measured.
+    """
     sc = getattr(layer, "scale", None)
     if sc is None:
         return None
     sc_tuple = tuple(float(v) for v in sc)
+    if not sc_tuple:
+        return None
     if len(sc_tuple) >= ndim:
         return sc_tuple[-ndim:]
-    return None
+    return (1.0,) * (ndim - len(sc_tuple)) + sc_tuple
 
 
 def _spatial_units_for_ndim(layer, ndim: int) -> tuple[object, ...] | None:
+    """Per-axis units for a new layer of rank ``ndim``, taken from ``layer``.
+
+    Every ``viewer.add_*`` call in the plugin obtains its ``units`` here, so
+    returning ``None`` means the new layer is created with napari's default of
+    pixels. Beside calibrated image layers that reads as a genuine
+    disagreement, and napari responds with "Inconsistent units across layers;
+    units will not be used for rendering" — dropping the scale bar's physical
+    units for the whole viewer. So ``None`` is returned only when there is no
+    unit to copy at all (an uncalibrated reference, or napari < 0.9, which has
+    no per-layer units); a rank that the reference does not cover is widened
+    instead of abandoned. SIGMA writes one unit on every axis, time included
+    (`_reader._units_for_ndim`), so repeating the outermost entry reproduces
+    exactly what the reader would have written.
+    """
     units = getattr(layer, "units", None)
     if units is None:
         return None
     units_tuple = tuple(units)
+    if not units_tuple:
+        return None
     if len(units_tuple) >= ndim:
         return units_tuple[-ndim:]
-    return None
+    return (units_tuple[0],) * (ndim - len(units_tuple)) + units_tuple
 
 
 def _get_pixel_size_tuple(layer, ndim: int):
@@ -414,6 +520,46 @@ def _is_analysis_candidate_layer(layer) -> bool:
     return bool(unique is not None and np.all(np.isfinite(unique)))
 
 
+_SIGMA_RESULT_METADATA_KEYS = (
+    "is_frangi",
+    "is_segmentation",
+    "is_tracking",
+    "is_proximity_roi_mask",
+)
+
+
+def _is_raw_intensity_layer(layer_item) -> bool:
+    """A plain image layer rather than a SIGMA result or an overlay."""
+    if layer_item is None or not hasattr(layer_item, "data"):
+        return False
+    md = getattr(layer_item, "metadata", {}) or {}
+    if is_analysis_aux_metadata(md):
+        return False
+    if any(md.get(key) for key in _SIGMA_RESULT_METADATA_KEYS):
+        return False
+    if md.get("sigma_layer_role"):
+        return False
+    layer_type = str(getattr(layer_item, "_type_string", "") or "").lower()
+    layer_class = layer_item.__class__.__name__.lower()
+    return layer_type == "image" or layer_class == "image"
+
+
+def _covers_same_field_of_view(layer_item, layer) -> bool:
+    """Whether both layers span the same YX extent.
+
+    Used to recognise the intensity image a mask was derived from without
+    relying on ``group_id``: a raw stack opened by drag-and-drop keeps the
+    group it was minted with, which need not be the group of a response
+    computed from a separately loaded file. Z and T are ignored because the
+    mask may cover only a sub-range of them.
+    """
+    own = tuple(int(value) for value in getattr(getattr(layer_item, "data", None), "shape", ()) or ())
+    other = tuple(int(value) for value in getattr(getattr(layer, "data", None), "shape", ()) or ())
+    if len(own) < 2 or len(other) < 2:
+        return False
+    return own[-2:] == other[-2:]
+
+
 def _is_related_group_layer(layer_item, layer, group_id: str | None) -> bool:
     md = getattr(layer_item, "metadata", {}) or {}
     same_group = group_id is not None and md.get("group_id") == group_id
@@ -423,6 +569,10 @@ def _is_related_group_layer(layer_item, layer, group_id: str | None) -> bool:
         or md.get("is_denoise")
         or (md.get("is_segmentation") and same_group)
         or same_group
+        # The raw intensity image sits under the mask and hides the object
+        # labels. It is not always in the analysed layer's group, so it is
+        # matched by extent instead.
+        or (_is_raw_intensity_layer(layer_item) and _covers_same_field_of_view(layer_item, layer))
     )
 
 
@@ -1017,7 +1167,13 @@ def _topology_details_from_skeleton(
             continue
         endpoint_points.add(tip)
         endpoint_regions.append({"center": tuple(float(v) for v in tip), "size": 1})
-    if not endpoint_regions:
+    # A closed loop legitimately has no degree-1 and no degree-3 voxel, so it
+    # produces no endpoint regions — but its circumference *was* measured:
+    # branch_lengths above sums every record, including the loop's. Falling
+    # back on an absent endpoint therefore threw away a correct measurement
+    # and replaced it with a principal-axis chord (a ring measured ~4x short,
+    # plus two fabricated endpoints). Only fall back when nothing was measured.
+    if total_branch_length <= 0.0 or branch_number < 1:
         fallback = _principal_axis_fallback_topology(simplified_skeleton, pixel_size)
         if fallback is not None:
             return fallback
@@ -1183,16 +1339,31 @@ def _prune_short_terminal_branches_3d(
     if not branch_records or len(pixel_size) != 3:
         return branch_records
 
-    # Full-image analyses provide one equivalent-diameter threshold for every
-    # object. The local-radius path remains for direct single-object callers.
-    min_terminal_length = 2.0 * float(np.mean(pixel_size[-2:]))
+    # Both paths threshold on a *radius*, never a diameter.
+    #
+    # A terminal branch shorter than the maximal inscribed-sphere radius at
+    # its junction lies entirely inside that sphere, so it never leaves the
+    # object's own local body and can only be a skeletonisation spur. A branch
+    # longer than the radius does reach past it and is treated as real. Using
+    # a diameter would additionally discard genuine short side branches.
+    #
+    # Full-image analyses pass one global equivalent radius for every object;
+    # the local per-junction radius path remains for direct single-object
+    # callers.
+    #
+    # The two paths treat the lower bound differently, on purpose. The global
+    # path applies none, so its threshold is exactly the measured equivalent
+    # radius. The local path keeps this 2-voxel bound, which also serves as
+    # the threshold for any node whose radius could not be measured: a branch
+    # shorter than two voxels is below the sampling limit either way.
+    local_min_terminal_length = 2.0 * float(np.mean(pixel_size[-2:]))
     uniform_terminal_length: float | None = None
     if terminal_prune_length is not None:
         candidate = float(terminal_prune_length)
         if np.isfinite(candidate) and candidate >= 0.0:
             uniform_terminal_length = candidate
 
-    junction_min_lengths: dict[int, float] = {}
+    junction_radii: dict[int, float] = {}
     if uniform_terminal_length is None and mask is not None and junction_regions_by_id:
         mask_bool = np.asarray(mask, dtype=bool)
         if mask_bool.ndim == 3 and mask_bool.shape:
@@ -1208,17 +1379,20 @@ def _prune_short_terminal_branches_3d(
                     ):
                         radii.append(float(distance[point_tuple]))
                 if radii:
-                    junction_min_lengths[int(junction_id)] = max(
-                        min_terminal_length,
-                        2.0 * float(np.max(radii)),
+                    # Radius, not diameter: this used to be 2 * radius, so the
+                    # two paths pruned at thresholds differing by a factor of
+                    # two. The lower bound is kept here (see above).
+                    junction_radii[int(junction_id)] = max(
+                        local_min_terminal_length,
+                        float(np.max(radii)),
                     )
 
     def _junction_threshold(node) -> float:
         if uniform_terminal_length is not None:
             return uniform_terminal_length
         if node is None or node[0] != "junction":
-            return min_terminal_length
-        return junction_min_lengths.get(int(node[1]), min_terminal_length)
+            return local_min_terminal_length
+        return junction_radii.get(int(node[1]), local_min_terminal_length)
 
     kept: list[dict[str, Any]] = []
     for branch in branch_records:
@@ -1462,11 +1636,19 @@ def _major_axis_length_in_units(prop, pixel_size: tuple[float, ...]) -> float:
 
 
 def _perimeter_in_units(mask: np.ndarray, pixel_size: tuple[float, ...]) -> float:
-    """Estimate boundary length in physical coordinates.
+    """Boundary length from interpolated contours, in physical coordinates.
 
-    Preserve the historical estimator for square pixels. For unequal spacings,
-    measure interpolated contours in calibrated coordinates instead of applying
-    an orientation-independent average scale.
+    One estimator for every spacing. Square pixels used to take a different
+    branch (``skimage.measure.perimeter`` scaled by one spacing value), which
+    is a different estimator and does not agree with this one, so perimeters
+    measured on isotropic and anisotropic acquisitions were not comparable.
+    Worse, the branch was chosen by ``np.isclose(..., rtol=1e-12)``, so a
+    one-part-in-a-billion rounding difference in the calibration metadata
+    silently switched estimators.
+
+    Marching-squares contours are the estimator kept because they are correct
+    for both cases: each segment is scaled per axis before its length is taken,
+    so anisotropy is handled rather than averaged away.
     """
     binary = np.asarray(mask, dtype=bool)
     if binary.ndim != 2 or not np.any(binary):
@@ -1474,8 +1656,7 @@ def _perimeter_in_units(mask: np.ndarray, pixel_size: tuple[float, ...]) -> floa
     spacing = np.asarray(pixel_size[-2:] if pixel_size else (1.0, 1.0), dtype=float)
     if spacing.shape != (2,) or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
         raise ValueError("Pixel spacing must be finite and positive.")
-    if np.isclose(spacing[0], spacing[1], rtol=1e-12, atol=0):
-        return float(perimeter(binary, neighborhood=8) * spacing[0])
+    # Padding keeps objects that touch the border closed.
     contours = find_contours(np.pad(binary, 1).astype(float), 0.5, fully_connected="high")
     return float(sum(np.linalg.norm(np.diff(contour, axis=0) * spacing, axis=1).sum()
                      for contour in contours))
@@ -1749,20 +1930,6 @@ class SegmentAnalysisMixin:
             ax.set_facecolor(bg)
             _style_ax(ax, fg, grid)
 
-    def _analyze_segmentation_layer(self, layer):
-        frame_index = self._analysis_current_frame_index(layer)
-        binary = _component_mask_from_layer(layer, frame_index=frame_index)
-        unit = _get_units_from_layer(layer)
-        voxel_size = _get_pixel_size_tuple(layer, binary.ndim)
-        labels, object_rows, plot_info, topology_cache = analyze_binary_components(
-            binary,
-            unit=unit,
-            voxel_size=voxel_size,
-            frame_index=frame_index,
-        )
-        self._analysis_topology_cache = topology_cache
-        return labels, object_rows, plot_info
-
     def _apply_analysis_result(
         self,
         layer,
@@ -1827,70 +1994,11 @@ class SegmentAnalysisMixin:
         if not rows:
             return []
         layer = self._selected_analysis_layer()
-        unit = _get_units_from_layer(layer) if layer is not None else "um"
-        labels: list[str] = []
-        for column in self._analysis_columns(rows[0]):
-            if column == "label":
-                labels.append("object label")
-            elif column == "frame":
-                labels.append("frame")
-            elif column == "object_label":
-                labels.append("object label")
-            elif column == "branch_index":
-                labels.append("branch")
-            elif column == "branch_length":
-                labels.append(f"branch length ({unit})")
-            elif column == "pixels":
-                labels.append("pixels (count)")
-            elif column == "voxels":
-                labels.append("voxels (count)")
-            elif column == "perimeter":
-                labels.append(f"perimeter ({unit})")
-            elif column == "area":
-                labels.append(f"area ({unit}^2)")
-            elif column == "surface_area":
-                labels.append(f"surface area ({unit}^2)")
-            elif column == "volume":
-                labels.append(f"volume ({unit}^3)")
-            elif column == "total_branch_length":
-                labels.append(f"total branch length ({unit})")
-            elif column == "branch_number":
-                labels.append("branch number")
-            elif column == "junction_number":
-                labels.append("junction number")
-            elif column == "mean_branch_length":
-                labels.append(f"mean branch length ({unit})")
-            elif column == "endpoint_number":
-                labels.append("endpoint number")
-            elif column == "length source":
-                labels.append("length source")
-            else:
-                labels.append(column)
-        return labels
+        unit = measurement_unit_for_layer(layer) if layer is not None else "px"
+        return analysis_column_labels(rows[0], unit)
 
     def _analysis_columns(self, row: dict[str, float | int]) -> list[str]:
-        preferred = [
-            "label",
-            "frame",
-            "object_label",
-            "branch_index",
-            "branch_length",
-            "pixels",
-            "voxels",
-            "perimeter",
-            "area",
-            "surface_area",
-            "volume",
-            "branch_number",
-            "junction_number",
-            "endpoint_number",
-            "total_branch_length",
-            "mean_branch_length",
-            "length source",
-        ]
-        columns = [column for column in preferred if column in row and not str(column).startswith("_")]
-        columns.extend(column for column in row if column not in columns and not str(column).startswith("_"))
-        return columns
+        return analysis_columns(row)
 
     def _analysis_export_headers_and_rows(self) -> tuple[list[str], list[list[str]]]:
         if not self._analysis_rows:
@@ -1949,7 +2057,7 @@ class SegmentAnalysisMixin:
             self,
             title,
             default_name,
-            "CSV (*.csv);;Text (*.txt);;Excel Workbook (*.xlsx)",
+            _TABLE_EXPORT_FILTER,
         )
         if not path:
             return
@@ -2000,7 +2108,7 @@ class SegmentAnalysisMixin:
             self,
             "Export measurements",
             "mitochondria_measurements.csv",
-            "CSV (*.csv);;Text (*.txt);;Excel Workbook (*.xlsx)",
+            _TABLE_EXPORT_FILTER,
         )
         if not path:
             return
@@ -2027,7 +2135,7 @@ class SegmentAnalysisMixin:
             self,
             "Export branch lengths",
             "mitochondria_branch_lengths.csv",
-            "CSV (*.csv);;Text (*.txt);;Excel Workbook (*.xlsx)",
+            _TABLE_EXPORT_FILTER,
         )
         if not path:
             return
@@ -2602,15 +2710,26 @@ class SegmentAnalysisMixin:
         if not items:
             return
         selected_labels: set[int] = set()
+        # The table stores the object label in UserRole and the object-local,
+        # 1-based branch index in UserRole + 1 (see _analysis_branch_rows).
+        # Only the label was read here, so _update_analysis_branch_highlight
+        # was never called with a non-empty set and the per-branch overlay
+        # could not render — selecting a branch highlighted the whole object.
+        selected_branches: set[tuple[int, int]] = set()
         for item in items:
             object_label = item.data(Qt.UserRole)
             if object_label is None:
                 continue
             selected_labels.add(int(object_label))
+            branch_index = item.data(Qt.UserRole + 1)
+            if branch_index is not None:
+                with suppress(TypeError, ValueError):
+                    selected_branches.add((int(object_label), int(branch_index)))
         if selected_labels:
             self._analysis_selected_ids = selected_labels
             self._select_analysis_rows_for_labels(selected_labels)
             self._update_highlight_for_labels(layer, selected_labels)
+            self._update_analysis_branch_highlight(layer, selected_branches)
 
     def _on_analyze_objects_clicked(self) -> None:
         layer = self._selected_analysis_layer()

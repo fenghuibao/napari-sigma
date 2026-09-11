@@ -4,7 +4,9 @@ import colorsys
 import csv
 import gc
 import importlib
+import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
 from dataclasses import dataclass
@@ -15,6 +17,7 @@ from uuid import uuid4
 
 import dask.array as da
 import numpy as np
+from napari.layers import Image as NapariImage
 from napari.layers import Labels as NapariLabels
 from qtpy.QtCore import (
     QEvent,
@@ -61,8 +64,40 @@ from qtpy.QtWidgets import (
 from scipy import ndimage as ndi
 from skimage.exposure import rescale_intensity
 
+_log = logging.getLogger(__name__)
+# Qt's "no maximum" sentinel. qtpy does not re-export QWIDGETSIZE_MAX, and the
+# value is fixed by Qt's API.
+_QWIDGETSIZE_MAX = 16777215
+# Metadata keys that mean a layer's geometry/provenance is already established.
+# Recovering calibration would overwrite these, so their presence is a veto;
+# unrelated keys added by other plugins are not.
+# Event-overlay palette. One definition: the table and the golden-ratio step
+# were copied into three places, so a new tracking kind coloured one view only.
+_TRACKING_EVENT_BASE_HUES = {
+    "linear": 0.72,
+    "fission": 0.03,
+    "fusion": 0.53,
+    "split-merge": 0.14,
+}
+_GOLDEN_RATIO_CONJUGATE = 0.61803398875
+
+
+def _tracking_event_hue(group_kind, index) -> float:
+    """Hue for the nth event of a group kind; caller passes a *group* kind."""
+    base = _TRACKING_EVENT_BASE_HUES.get(str(group_kind), 0.0)
+    return (base + int(index) * _GOLDEN_RATIO_CONJUGATE) % 1.0
+
+
+_AUTHORITATIVE_LAYER_METADATA = frozenset({
+    "axes", "dims", "dims_out", "inferred_dims", "storage_dims",
+    "scale_per_axis", "sigma_calibration_source", "unit", "source",
+    "managed_by_plugin", "layer_type",
+})
+
 from ._analysis import (
     AnalysisCancelledError,
+    analysis_column_labels,
+    analysis_columns,
     SegmentAnalysisMixin,
     _analysis_branch_rows_from_rows,
     _component_mask_from_layer,
@@ -88,6 +123,7 @@ from ._proximity import (
     is_proximity_segmentation_candidate_layer,
 )
 from ._image_io import (
+    SUPPORTED_IMAGE_SUFFIXES,
     load_image_tc_zyx,
 )
 from ._layer_candidates import is_binary_mask_data
@@ -106,7 +142,12 @@ from ._tracking import (
 )
 from ._writer import write_single_image
 from ._reader import napari_get_reader as napari_get_reader, tczyx_to_layer_data  # legacy import path
-from ._metadata import layer_dims_tag as _layer_dims_tag, unit_from_metadata
+from ._metadata import (
+    axes_for_ndim as _axes_for_ndim,
+    dims_tag_from_metadata as _dims_tag_from_metadata,
+    layer_dims_tag as _layer_dims_tag,
+    unit_from_metadata,
+)
 
 
 def _prefer_numba_workqueue() -> None:
@@ -125,6 +166,40 @@ def _prefer_numba_workqueue() -> None:
             numba.config.THREADING_LAYER = "workqueue"
 
 
+def _claim_image_readers() -> None:
+    """Route image files to SIGMA's reader, which calibrates at construction.
+
+    Opening the panel is the point where the user has said they want SIGMA to
+    handle this data, so it is also where this belongs. It has to be a reader
+    preference and cannot be done from a layer callback: napari's own
+    ``inserted`` handler reaches a canvas draw synchronously inside
+    ``LayerList.insert``, and that draw runs the unit-consistency check while a
+    layer from napari's built-in reader is still on the default "pixel" unit.
+    Plugin callbacks are ordered after every core callback by construction
+    (``EventEmitter.connect`` partitions on ``_is_core_callback``), so nothing
+    the panel does on insertion can precede it. See
+    ``_launcher.prefer_sigma_reader`` for the full account.
+
+    Best-effort and quiet: a napari without this setting, or a user who has
+    assigned these patterns to another plugin, must not stop the panel from
+    opening.
+    """
+    try:
+        from ._launcher import prefer_sigma_reader
+
+        result = prefer_sigma_reader()
+    except Exception:
+        _log.debug("Could not set the preferred image reader", exc_info=True)
+        return
+    if result["changed"]:
+        _log.info("SIGMA now reads %s", ", ".join(sorted(result["changed"])))
+    if result["kept"]:
+        _log.info(
+            "Left these patterns with their assigned reader: %s",
+            ", ".join(f"{k} -> {v}" for k, v in sorted(result["kept"].items())),
+        )
+
+
 def _metadata_units_for_ndim(metadata: dict[str, Any] | None, ndim: int):
     if not hasattr(NapariLabels, "units"):
         return None
@@ -138,6 +213,32 @@ def _metadata_units_for_ndim(metadata: dict[str, Any] | None, ndim: int):
 def _spatial_unit_kwargs(layer, ndim: int) -> dict[str, Any]:
     units = _spatial_units_for_ndim(layer, ndim)
     return {"units": units} if units is not None else {}
+
+
+def _units_already_set(layer, desired) -> bool:
+    """Whether assigning ``desired`` to ``layer.units`` would change nothing.
+
+    A plain string comparison is not enough: napari stores ``pint.Unit``
+    objects, so a layer holding micrometre stringifies as "micrometer" while
+    SIGMA's metadata says "um". Those are the same unit, and comparing the
+    spellings would report a difference every time, defeating the check. So
+    the desired names are put through napari's own converter first.
+    """
+    current = tuple(getattr(layer, "units", None) or ())
+    desired = tuple(desired)
+    if len(current) != len(desired):
+        return False
+    try:
+        from napari.utils.transforms._units import get_units_from_name
+
+        return current == tuple(get_units_from_name(desired))
+    except Exception:
+        # No converter (napari < 0.9, or a private path that moved): fall back
+        # to spellings. Worst case this reports "changed" and we assign, which
+        # is the previous behaviour.
+        return tuple(str(value) for value in current) == tuple(
+            str(value) for value in desired
+        )
 
 
 def _limit_display_points(points: np.ndarray, max_points: int) -> np.ndarray:
@@ -610,8 +711,13 @@ def _downsample_binary_xy_preserve_components(
 # Small utilities
 # ---------------------------------------------------------------------
 
-def _as_list(x):
-    return list(x) if isinstance(x, list | tuple) else ([x] if x is not None else [])
+def _format_proximity_frame(frame) -> str:
+    """Render a proximity row's frame; full-image mode pools time as -1."""
+    try:
+        value = int(frame)
+    except (TypeError, ValueError):
+        return ""
+    return "all" if value < 0 else str(value)
 
 
 def _get_source_from_layer(layer) -> str | None:
@@ -757,7 +863,7 @@ def _is_tracking_candidate_layer(layer) -> bool:
     if _is_analysis_aux_layer(layer):
         return False
     md = getattr(layer, "metadata", {}) or {}
-    dims = str(md.get("dims") or md.get("dims_out") or "").upper()
+    dims = _dims_tag_from_metadata(md)
     if dims not in {"TYX", "TZYX"}:
         return False
     data = getattr(layer, "data", None)
@@ -811,11 +917,7 @@ def _is_tracking_overlay_layer(layer, reference_layer=None) -> bool:
     data = getattr(layer, "data", None)
     if getattr(data, "ndim", None) not in {3, 4} or int(getattr(data, "size", 0)) == 0:
         return False
-    dims = str(
-        (getattr(layer, "metadata", {}) or {}).get("dims")
-        or (getattr(layer, "metadata", {}) or {}).get("dims_out")
-        or ""
-    ).upper()
+    dims = _layer_dims_tag(layer)
     if dims and dims not in {"TYX", "TZYX"}:
         return False
     if reference_layer is None or not hasattr(reference_layer, "data"):
@@ -1653,75 +1755,26 @@ class AnalysisExportWorker(QObject):
 
     @staticmethod
     def _columns_from_rows(rows: list[dict[str, float | int]]) -> list[str]:
-        if not rows:
-            return []
-        preferred = [
-            "frame",
-            "pixels",
-            "voxels",
-            "area",
-            "volume",
-            "branch_number",
-            "junction_number",
-            "endpoint_number",
-            "total_branch_length",
-            "mean_branch_length",
-            "length source",
-        ]
-        columns = [column for column in preferred if column in rows[0] and column != "label"]
-        columns.extend(column for column in rows[0] if column not in columns and column != "label")
-        return columns
+        # Same column set and order as every other analysis table/export.
+        return analysis_columns(rows[0] if rows else None)
 
     def _column_labels(self, rows: list[dict[str, float | int]]) -> list[str]:
-        labels: list[str] = []
-        for column in self._columns_from_rows(rows):
-            if column == "frame":
-                labels.append("frame")
-            elif column == "pixels":
-                labels.append("pixels (count)")
-            elif column == "voxels":
-                labels.append("voxels (count)")
-            elif column == "area":
-                labels.append(f"area ({self.unit}^2)")
-            elif column == "volume":
-                labels.append(f"volume ({self.unit}^3)")
-            elif column == "total_branch_length":
-                labels.append(f"total branch length ({self.unit})")
-            elif column == "branch_number":
-                labels.append("branch number")
-            elif column == "junction_number":
-                labels.append("junction number")
-            elif column == "mean_branch_length":
-                labels.append(f"mean branch length ({self.unit})")
-            elif column == "endpoint_number":
-                labels.append("endpoint number")
-            elif column == "length source":
-                labels.append("length source")
-            else:
-                labels.append(column)
-        return labels
+        return analysis_column_labels(rows[0] if rows else None, self.unit)
 
     def _branch_headers_and_rows(self, rows: list[dict[str, float | int]]) -> tuple[list[str], list[list[str]]]:
+        # Was a fixed four-column list with no extend, so any new branch metric
+        # appeared in the single-frame export and silently vanished here.
         if not rows:
             return [], []
-        sample = rows[0]
-        preferred = ["frame", "object_label", "branch_index", "branch_length"]
-        columns = [column for column in preferred if column in sample and not str(column).startswith("_")]
-        headers: list[str] = []
-        for column in columns:
-            if column == "frame":
-                headers.append("frame")
-            elif column == "object_label":
-                headers.append("object label")
-            elif column == "branch_index":
-                headers.append("branch")
-            elif column == "branch_length":
-                headers.append(f"branch length ({self.unit})")
-            else:
-                headers.append(column)
-        out_rows: list[list[str]] = []
-        for row in rows:
-            out_rows.append([f"{row[column]:.6g}" if isinstance(row[column], float) else str(row[column]) for column in columns])
+        columns = analysis_columns(rows[0])
+        headers = analysis_column_labels(rows[0], self.unit)
+        out_rows = [
+            [
+                f"{row[column]:.6g}" if isinstance(row[column], float) else str(row[column])
+                for column in columns
+            ]
+            for row in rows
+        ]
         return headers, out_rows
 
     def run(self):
@@ -1788,12 +1841,16 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._disposed = False
         self._worker_callback_generation = 0
         self._hooks_installed = False
+        # Calibration read during layer insertion, consumed by the deferred
+        # repair, so the TIFF header is parsed once per inserted layer.
+        self._pending_layer_calibration: dict[int, dict[str, Any]] = {}
         self._viewer_connections = []
         self._menu_patch = None
         self._zoom_callback = None
         self._dock_widget = None
         self._ui_ready = False
         _prefer_numba_workqueue()
+        _claim_image_readers()
         self._main_thread_dispatch.connect(
             self._execute_main_thread_callback,
             Qt.QueuedConnection,
@@ -1998,7 +2055,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._analysis_tab = self._build_analysis_page()
         tabs.addTab(self._analysis_tab, "Morphology Analysis")
         self._tracking_tab = self._build_tracking_page()
-        tabs.addTab(self._tracking_tab, "Tracking")
+        tabs.addTab(self._tracking_tab, "Tracking Analysis")
         self._proximity_tab = self._build_proximity_page()
         tabs.addTab(self._proximity_tab, "Proximity Analysis")
         tabs.currentChanged.connect(self._on_panel_tab_changed)
@@ -2012,6 +2069,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
         # initial state
         self._configure_responsive_ui()
+        self._refresh_frangi_response_mode_availability()
         self._update_info()
         self._fit_view_and_scalebar()
         self._disable_wheel_adjustment_on_inputs()
@@ -2059,6 +2117,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._worker_callback_generation += 1
         self._analysis_request_id += 1
         self._analysis_pending_frame_key = None
+        # Holds strong layer references; a cancelled deferred pass never
+        # consumes them.
+        self._pending_layer_calibration.clear()
         for timer in self.findChildren(QTimer):
             timer.stop()
         for thread, worker in list(self._analysis_jobs.items()):
@@ -2115,9 +2176,63 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self.dispose()
         super().closeEvent(event)
 
+    def _sync_processing_action_label_widths(self) -> None:
+        """Widen the shared action-label column to fit its longest text.
+
+        The three labels sit in one column each so the rows line up, and the
+        neighbouring spin-box columns carry all the stretch — so that column
+        never grows past whatever minimum it is given. Pinning it to a
+        hard-coded width therefore clipped the longest label ("Gaussian
+        background") outright, with no ellipsis and no tooltip.
+
+        Measuring has to happen when the font is final: _configure_responsive_ui
+        runs during construction, before napari applies its theme, so a width
+        measured there can be an underestimate. This is re-run from showEvent,
+        by which point sizeHint reflects the real font.
+        """
+        labels = (
+            getattr(self, "upsample_action_label", None),
+            getattr(self, "denoise_action_label", None),
+            getattr(self, "gaussian_action_label", None),
+        )
+        if not any(label is not None for label in labels):
+            return
+        needed = 0
+        for label in labels:
+            if label is None:
+                continue
+            # Clear any earlier pin before measuring, and never set a maximum.
+            label.setMaximumWidth(_QWIDGETSIZE_MAX)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            with suppress(Exception):
+                label.adjustSize()
+            needed = max(needed, int(label.sizeHint().width()), self._text_width_px(label))
+        floor = self._scaled_px(int(getattr(self, "_processing_action_width_floor", 104)))
+        width = max(floor, needed)
+        for label in labels:
+            if label is None:
+                continue
+            label.setMinimumWidth(width)
+            if not label.toolTip():
+                label.setToolTip(label.text())
+        # The column itself has to be at least this wide, otherwise the
+        # stretching neighbours keep it at the old size.
+        for row_layout, column in (
+            (getattr(self, "_row_upsample_layout", None), 1),
+            (getattr(self, "_row_med_layout", None), 0),
+            (getattr(self, "_row_gaussian_layout", None), 1),
+        ):
+            if row_layout is not None:
+                with suppress(Exception):
+                    row_layout.setColumnMinimumWidth(column, width)
+
     def showEvent(self, event):
         if self._ui_ready and self._disposed:
             self._install_viewer_hooks()
+        # Re-measure now that the theme font is in effect.
+        with suppress(Exception):
+            self._sync_processing_action_label_widths()
         super().showEvent(event)
 
     def _disable_double_click_zoom(self) -> None:
@@ -2168,8 +2283,14 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         setattr(self, worker_attr, None)
         setattr(self, thread_attr, None)
 
-    @staticmethod
-    def _release_worker_resources(thread, worker) -> None:
+    # Cancellation is only polled between sigmas/EM iterations, so a worker can
+    # take a while to notice. Waiting without a bound freezes the whole napari
+    # window when the dock is closed mid-run; wait long enough for an orderly
+    # exit, then let Qt reap the thread through deleteLater instead.
+    _WORKER_WAIT_MS = 5000
+
+    @classmethod
+    def _release_worker_resources(cls, thread, worker) -> None:
         if worker is not None:
             with suppress(Exception):
                 worker.deleteLater()
@@ -2177,7 +2298,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             with suppress(Exception):
                 thread.quit()
             with suppress(Exception):
-                thread.wait()
+                if not thread.wait(cls._WORKER_WAIT_MS):
+                    _log.warning(
+                        "Worker thread did not finish within %d ms; "
+                        "leaving it to Qt to reap.", cls._WORKER_WAIT_MS,
+                    )
         if thread is not None:
             with suppress(Exception):
                 thread.deleteLater()
@@ -2812,12 +2937,29 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             vheader.setDefaultSectionSize(self._scaled_px(24))
 
     def _set_strict_fixed_width(self, widget, width: int) -> None:
+        self._set_strict_fixed_width_px(widget, self._scaled_px(width))
+
+    @staticmethod
+    def _set_strict_fixed_width_px(widget, px: int) -> None:
+        """Pin a widget to an already-scaled pixel width."""
         if widget is None:
             return
-        px = self._scaled_px(width)
+        px = int(px)
         widget.setMinimumWidth(px)
         widget.setMaximumWidth(px)
         widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    @staticmethod
+    def _text_width_px(widget) -> int:
+        """Rendered width of a widget's own text, 0 if it cannot be measured."""
+        if widget is None:
+            return 0
+        with suppress(Exception):
+            metrics = widget.fontMetrics()
+            text = widget.text()
+            advance = getattr(metrics, "horizontalAdvance", None)
+            return int(advance(text)) if advance is not None else int(metrics.width(text))
+        return 0
 
     def _set_adaptive_width(self, widget, min_width: int) -> None:
         if widget is None:
@@ -2856,6 +2998,12 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         ):
             if row_layout is not None:
                 row_layout.setSpacing(self._scaled_px(4 if compact else 6))
+                # The enable checkbox sits in column 0 and its label in column
+                # 1; napari's theme gives a bare checkbox a fairly wide
+                # indicator, so keep the gap between them small. The label
+                # column's own width is set by
+                # _sync_processing_action_label_widths.
+                row_layout.setHorizontalSpacing(self._scaled_px(2))
 
         for btn in (
             self.open_btn,
@@ -2983,12 +3131,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             if label is not None:
                 self._set_strict_fixed_width(label, label_width)
 
-        for label in (
-            self.upsample_action_label,
-            self.denoise_action_label,
-            self.gaussian_action_label,
-        ):
-            self._set_strict_fixed_width(label, processing_action_width)
+        self._processing_action_width_floor = processing_action_width
+        self._sync_processing_action_label_widths()
         for label in (
             self.upsample_factor_label,
             self.filter_size_label,
@@ -3035,7 +3179,6 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             self._seg_frangi_layer_combo,
         ):
             self._set_adaptive_width(widget, medium_width)
-        self._set_adaptive_width(self.device_combo, 180 if compact else 220)
 
         for widget in (
             self.track_max_dist,
@@ -3178,12 +3321,33 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         with suppress(Exception):
             scale_bar.visible = True
             active_layer = self.viewer.layers.selection.active
-            if active_layer is not None:
-                if hasattr(active_layer, "units"):
-                    active_layer.units = (unit,) * _layer_display_ndim(active_layer)
-                else:
-                    # napari < 0.9 stored the display unit on the scale bar.
-                    scale_bar.unit = unit
+            if active_layer is not None and not hasattr(active_layer, "units"):
+                # napari < 0.9 stored the display unit on the scale bar.
+                scale_bar.unit = unit
+            else:
+                # napari 0.9 reads units per layer and refuses to render them
+                # when layers disagree, so stamping only the active layer makes
+                # every other calibrated layer inconsistent with it. Give each
+                # layer the unit its own metadata declares, defaulting to this
+                # one; layers with no SIGMA unit are left for their owner.
+                for other in self.viewer.layers:
+                    if not hasattr(other, "units"):
+                        continue
+                    metadata = getattr(other, "metadata", {}) or {}
+                    layer_unit = metadata.get("unit") or unit
+                    if metadata.get("unit") is None and other is not active_layer:
+                        continue
+                    with suppress(Exception):
+                        # Assigning is not free: napari's units setter clears
+                        # the layer's extent cache, calls refresh() and emits
+                        # events.units, which asks the canvas for another
+                        # world-units update. This loop runs for every layer
+                        # on every view fit, so re-assigning an unchanged
+                        # value produced dozens of redundant invalidations per
+                        # import (visible in trace_units_warning.py output).
+                        desired = (layer_unit,) * _layer_display_ndim(other)
+                        if not _units_already_set(other, desired):
+                            other.units = desired
             scale_bar.position = "bottom_right"
             scale_bar.font_size = self._scaled_px(8)
 
@@ -3290,7 +3454,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         md = getattr(layer, "metadata", {}) or {}
         source = md.get("source") or _get_source_from_layer(layer) or ""
         base, ext = os.path.splitext(os.path.basename(source))
-        if not ext or ext.lower() not in {".tif", ".tiff", ".png", ".jpg", ".jpeg"}:
+        if not ext or ext.lower() not in SUPPORTED_IMAGE_SUFFIXES:
             ext = ".tif"
         if not base:
             base = layer.name or "layer"
@@ -3392,6 +3556,8 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             self.slice_end_spin.blockSignals(True)
             self.slice_end_spin.setValue(end)
             self.slice_end_spin.blockSignals(False)
+        # Narrowing Z to a single plane makes the filter 2D.
+        self._refresh_frangi_response_mode_availability()
 
     def _preferred_denoised_input_layer(self):
         """Return the current denoised layer when it is still in the viewer."""
@@ -3583,6 +3749,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 idx = combo.findText(self.viewer.layers.selection.active.name)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.blockSignals(False)
+        # Signals were blocked above, so the response-mode gate has to be
+        # re-evaluated explicitly for the newly selected input.
+        self._refresh_frangi_response_mode_availability()
 
     def _rebuild_info_raw_layer_combo(self, *, prefer_denoised: bool = False) -> None:
         combo = getattr(self, "_info_raw_layer_combo", None)
@@ -3614,6 +3783,20 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             return None
         return combo.currentData()
 
+    def _select_imported_raw_layer(self, layer) -> None:
+        """An explicit file import becomes the displayed/processing input."""
+        if not _is_frangi_raw_candidate_layer(layer):
+            return
+        self._rebuild_layer_combos_if_needed()
+        for combo in (self._info_raw_layer_combo, self._frangi_raw_layer_combo,
+                      self._seg_raw_layer_combo):
+            index = combo.findText(layer.name)
+            if index >= 0:
+                previous = combo.blockSignals(True)
+                combo.setCurrentIndex(index)
+                combo.blockSignals(previous)
+        self._refresh_frangi_response_mode_availability()
+
     def _selected_segmentation_raw_layer(self):
         combo = getattr(self, "_seg_raw_layer_combo", None)
         if combo is None or combo.count() == 0:
@@ -3643,14 +3826,23 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         raw_shape = tuple(int(value) for value in raw_data.shape)
         frangi_shape = tuple(int(value) for value in frangi_data.shape)
         if raw_shape != frangi_shape:
+            # Reduce to the frame the Frangi run actually used. Taking the
+            # canvas slider's frame here would pair frame k's response with
+            # frame 0's raw data: the shapes match either way, so the mistake
+            # is silent and the segmentation is simply wrong.
+            frame = self._processing_time_index()
             with suppress(Exception):
-                raw_current = np.asarray(self._current_volume_from_layer(raw_layer))
+                raw_current = np.asarray(
+                    self._current_volume_from_layer(raw_layer, time_index=frame)
+                )
                 if raw_current.shape == frangi_shape:
                     raw_data = raw_current
                     raw_shape = tuple(int(value) for value in raw_current.shape)
             if raw_shape != frangi_shape:
                 with suppress(Exception):
-                    frangi_current = np.asarray(self._current_volume_from_layer(frangi_layer))
+                    frangi_current = np.asarray(
+                        self._current_volume_from_layer(frangi_layer, time_index=frame)
+                    )
                     if raw_shape == frangi_current.shape:
                         frangi_data = frangi_current
                         frangi_shape = tuple(int(value) for value in frangi_current.shape)
@@ -3754,6 +3946,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._set_ct_controls(T=int(data_tc_zyx.shape[0]), C=int(data_tc_zyx.shape[1]))
         if layers:
             self.viewer.layers.selection.active = layers[0]
+            self._select_imported_raw_layer(layers[0])
             _safe_axis_labels(self.viewer, layers[0])
             self._set_default_display_mode_for_imported_layer(layers[0])
         self._configure_scale_bar(meta.get("unit", "um"))
@@ -3763,21 +3956,6 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._update_info()
         return layers
 
-
-    def _sync_single_layer(self, layer):
-        with suppress(Exception):
-            md = layer.metadata if layer.metadata else {}
-            md["unit"] = _ensure_unit_in_metadata(md)
-            _ensure_group_id(md)
-            layer.metadata = md
-        self._configure_scale_bar(_get_units_from_layer(layer))
-        _safe_axis_labels(self.viewer, layer)
-        t_size = _time_size_from_layer(layer)
-        self._group_layers = [layer]
-        self._set_ct_controls(T=t_size, C=1)
-        self._set_z_range_for_data(layer)
-        self._set_default_display_mode_for_imported_layer(layer)
-        self._update_info()
 
     def _set_default_display_mode_for_imported_layer(self, layer) -> bool:
         if layer is None or not hasattr(layer, "data"):
@@ -3804,17 +3982,35 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             return False
         return True
 
-    def _current_volume_from_layer(self, layer) -> np.ndarray:
+    def _processing_time_index(self) -> int:
+        """The frame the processing controls select, not the canvas slider.
+
+        ``_extract_processing_series`` feeds the Frangi run ``arr[t0:t1+1]``
+        and, for a single-frame selection, frame ``t0``. Anything that later
+        has to line a volume up with that response must use the same frame:
+        ``viewer.dims.current_step`` is an independent control, and because the
+        shapes still match nothing would raise.
+        """
+        start, _end = self._selected_time_range()
+        return int(start)
+
+    def _current_volume_from_layer(self, layer, time_index: int | None = None) -> np.ndarray:
         arr = layer.data
         dims_tag = _layer_dims_tag(layer)
         t_idx0 = 0
         if dims_tag in {"TYX", "TZYX", "TCZYX"} or arr.ndim >= 4:
-            time_axis = _time_axis_index(self.viewer, layer)
-            if time_axis is None:
-                time_axis = _viewer_axis_for_layer_axis(self.viewer, layer, 0)
-            with suppress(Exception):
-                if time_axis is not None:
-                    t_idx0 = int(self.viewer.dims.current_step[time_axis])
+            if time_index is not None:
+                # An explicit frame is authoritative; do not consult the slider.
+                t_idx0 = int(time_index)
+            else:
+                time_axis = _time_axis_index(self.viewer, layer)
+                if time_axis is None:
+                    time_axis = _viewer_axis_for_layer_axis(self.viewer, layer, 0)
+                with suppress(Exception):
+                    if time_axis is not None:
+                        t_idx0 = int(self.viewer.dims.current_step[time_axis])
+            if arr.shape:
+                t_idx0 = max(0, min(t_idx0, int(arr.shape[0]) - 1))
         if dims_tag == "TYX":
             return arr[t_idx0]
         if dims_tag == "TZYX" or arr.ndim >= 4:
@@ -3946,7 +4142,13 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
     def _proximity_shape_ndim(self, layer) -> int:
         data = getattr(layer, "data", None)
-        dims_tag = str((getattr(layer, "metadata", {}) or {}).get("dims") or "").upper()
+        # _layer_dims_tag, not metadata["dims"]: a derived layer that squeezed
+        # time keeps dims="TZYX" while dims_out and the array are ZYX, and
+        # trusting "dims" here returned 4 for 3-D data. The ROI layer was then
+        # built with one axis more than the source, so its scale and units were
+        # dropped as mismatched (see _spatial_units_for_ndim) and napari
+        # reported inconsistent units.
+        dims_tag = _layer_dims_tag(layer)
         if dims_tag == "TYX":
             return 3
         if dims_tag == "TZYX":
@@ -3955,7 +4157,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
     def _proximity_spatial_ndim(self, layer) -> int:
         data = getattr(layer, "data", None)
-        dims_tag = str((getattr(layer, "metadata", {}) or {}).get("dims") or "").upper()
+        dims_tag = _layer_dims_tag(layer)
         if dims_tag == "TYX":
             return 2
         if dims_tag == "TZYX":
@@ -4182,14 +4384,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             path += ".tif"
 
         layer_metadata = dict(getattr(layer, "metadata", {}) or {})
-        dims_tag = str(
-            layer_metadata.get("dims") or layer_metadata.get("dims_out") or ""
-        ).upper()
+        dims_tag = _dims_tag_from_metadata(layer_metadata)
         if len(dims_tag) != roi_labels.ndim:
-            dims_tag = {2: "YX", 3: "ZYX", 4: "TZYX"}.get(
-                roi_labels.ndim,
-                "".join("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[-roi_labels.ndim :]),
-            )
+            dims_tag = _axes_for_ndim(roi_labels.ndim)
         layer_metadata.update(
             {
                 "dims": dims_tag,
@@ -4425,7 +4622,10 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             data = _normalized_layer_array(layer, allow_float=False)
         except (TypeError, ValueError):
             return []
-        dims_tag = str((getattr(layer, "metadata", {}) or {}).get("dims") or "").upper()
+        # dims_out-aware, and consistent with _proximity_shape_ndim: this tag
+        # decides how ROI vertices map onto the array's axes, so reading a
+        # stale "dims" here would index the wrong axis.
+        dims_tag = _layer_dims_tag(layer)
         current_step = tuple(int(v) for v in getattr(self.viewer.dims, "current_step", ()))
         return _proximity_roi_specs_from_shapes(
             shape_data,
@@ -5532,22 +5732,14 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
     @staticmethod
     def _tracking_event_rgba(kind: str, event_index: int) -> np.ndarray:
-        base_hues = {
-            "linear": 0.72,
-            "fission": 0.03,
-            "fusion": 0.53,
-            "split-merge": 0.14,
-        }
         group_kind = SIGMAWidget._tracking_event_group_kind(kind) or "linear"
-        hue = (
-            base_hues[group_kind] + int(event_index) * 0.61803398875
-        ) % 1.0
+        hue = _tracking_event_hue(group_kind, event_index)
         rgb = colorsys.hsv_to_rgb(hue, 0.72, 0.95)
         return np.asarray([*rgb, 1.0], dtype=float)
 
     @staticmethod
     def _tracking_object_rgba(det_id: int) -> np.ndarray:
-        hue = (0.11 + int(det_id) * 0.61803398875) % 1.0
+        hue = (0.11 + int(det_id) * _GOLDEN_RATIO_CONJUGATE) % 1.0
         rgb = colorsys.hsv_to_rgb(hue, 0.82, 1.0)
         return np.asarray([*rgb, 1.0], dtype=float)
 
@@ -6272,11 +6464,31 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 **_spatial_unit_kwargs(source_layer, np.asarray(layer_data).ndim),
             )
         else:
-            with suppress(Exception):
+            # All four assignments belong together. Letting a failed `data =`
+            # skip the rest while the layer is still registered below leaves
+            # the previous event kind's voxels on screen under the new kind's
+            # colours and legend. napari raises here on an ndim change, so
+            # rebuild the layer instead of half-updating it.
+            try:
                 event_layer.data = layer_data
                 event_layer.scale = scale
                 event_layer.translate = source_translate
                 event_layer.metadata = metadata
+            except Exception:
+                _log.exception("Could not update the tracking event layer in place; "
+                               "recreating it")
+                with suppress(Exception):
+                    self.viewer.layers.remove(event_layer)
+                event_layer = self.viewer.add_labels(
+                    layer_data,
+                    name=self._next_layer_name(
+                        f"{source_layer.name} tracking events"
+                    ),
+                    metadata=metadata,
+                    scale=scale,
+                    translate=source_translate,
+                    **_spatial_unit_kwargs(source_layer, np.asarray(layer_data).ndim),
+                )
 
         self._tracking_event_layers = {render_kind: event_layer}
         self._tracking_event_layer_color_maps = {render_kind: color_map}
@@ -7460,6 +7672,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             summary_table.clearContents()
             headers = [
                 "roi",
+                # ProximitySummaryRow carries a frame but never showed it, so
+                # a time series reported stack-wide statistics with nothing to
+                # say time had been collapsed. Full-image mode uses -1, which
+                # is rendered "all".
+                "frame",
                 f"source ({count_label})",
                 f"target ({count_label})",
                 f"overlap ({count_label})",
@@ -7478,6 +7695,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             for row_idx, row in enumerate(summary_rows):
                 values = [
                     row.roi_name,
+                    _format_proximity_frame(row.frame),
                     str(int(row.source_size)),
                     str(int(row.target_size)),
                     str(int(row.overlap_size)),
@@ -7679,6 +7897,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         physical_label = self._proximity_physical_unit_label(result)
         headers = [
             "roi",
+            # Was absent, so a time-series export silently reported stack-wide
+            # statistics. Full-image mode pools every frame and writes "all".
+            "frame",
             f"source_size_{count_label}",
             f"target_size_{count_label}",
             f"overlap_size_{count_label}",
@@ -7695,6 +7916,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         rows = [
             [
                 row.roi_name,
+                _format_proximity_frame(row.frame),
                 str(int(row.source_size)),
                 str(int(row.target_size)),
                 str(int(row.overlap_size)),
@@ -9145,13 +9367,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         alpha = 0.42
 
         def _event_color(event_index: int) -> np.ndarray:
-            base_hues = {
-                "linear": 0.72,
-                "fission": 0.03,
-                "fusion": 0.53,
-                "split-merge": 0.14,
-            }
-            hue = (base_hues.get(str(kind), 0.0) + event_index * 0.61803398875) % 1.0
+            hue = _tracking_event_hue(kind, event_index)
             sat = 0.72
             val = 0.95
             rgb = colorsys.hsv_to_rgb(hue, sat, val)
@@ -9218,13 +9434,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         target_events_by_frame: dict[int, list[tuple[int, int]]] = {}
 
         def _event_color(event_index: int) -> np.ndarray:
-            base_hues = {
-                "linear": 0.72,
-                "fission": 0.03,
-                "fusion": 0.53,
-                "split-merge": 0.14,
-            }
-            hue = (base_hues.get(str(kind), 0.0) + event_index * 0.61803398875) % 1.0
+            hue = _tracking_event_hue(kind, event_index)
             sat = 0.72
             val = 0.95
             rgb = colorsys.hsv_to_rgb(hue, sat, val)
@@ -10960,12 +11170,26 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                         else f"track_segmentations_ilp() error: {error!r}"
                     ),
                 )
-            else:
-                self.track_progress.setValue(1)
-                self.track_progress.setFormat("Finished")
-                self._add_tracking_result(layer, result, config=config)
-                apply_pending_import = pending_import is not None
-            self._cleanup_worker_thread("_tracking_thread", "_tracking_worker")
+            try:
+                if error is None:
+                    self.track_progress.setValue(1)
+                    self.track_progress.setFormat("Finished")
+                    self._add_tracking_result(layer, result, config=config)
+                    apply_pending_import = pending_import is not None
+            except Exception:
+                # As for the Frangi handler: building the result layers must
+                # not skip the cleanup below, or the thread is never quit and
+                # the button stays stuck on its "Stop" label.
+                self.track_progress.setFormat("Failed")
+                _log.exception("Could not add the tracking result layers")
+                QMessageBox.critical(
+                    self,
+                    "Tracking failed",
+                    "Tracking finished but its layers could not be created. "
+                    "See the log for details.",
+                )
+            finally:
+                self._cleanup_worker_thread("_tracking_thread", "_tracking_worker")
             if apply_pending_import and pending_import is not None:
                 self._apply_tracking_statistics_import(*pending_import)
 
@@ -11396,6 +11620,9 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         g.setVerticalSpacing(self._scaled_px(6))
 
         self._frangi_raw_layer_combo = QComboBox()
+        self._frangi_raw_layer_combo.currentIndexChanged.connect(
+            self._refresh_frangi_response_mode_availability
+        )
         g.addWidget(QLabel("Select layer:"), 0, 0, alignment=Qt.AlignRight)
         g.addWidget(self._frangi_raw_layer_combo, 0, 1, 1, 3)
 
@@ -11418,6 +11645,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self.kernel_spin = QSpinBox()
         self.kernel_spin.setRange(1, 20)
         self.kernel_spin.setValue(4)
+        # A radius >= the selected Z depth forces the 2D path, which cannot
+        # produce sheetness, so the gate depends on this value too.
+        self.kernel_spin.valueChanged.connect(
+            self._refresh_frangi_response_mode_availability
+        )
 
         g.addWidget(QLabel("Mode:"), 2, 0, alignment=Qt.AlignRight)
         g.addWidget(self.frangi_response_mode_combo, 2, 1)
@@ -11566,9 +11798,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         )
         self.rescale_apply_btn.clicked.connect(self._on_apply_component_rescale_clicked)
         g.addWidget(self.rescale_apply_btn, 14, 0, 1, 4)
-        self.frangi_rescale_checkbox.toggled.connect(
-            self._refresh_frangi_rescale_controls_state
-        )
+        self.frangi_rescale_checkbox.toggled.connect(self._on_frangi_rescale_toggled)
 
         self._on_frangi_response_mode_changed()
         self._refresh_frangi_component_view_buttons()
@@ -11728,13 +11958,47 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         return box
 
     # -----------------------------------------------------------------
-    # Open / drop interception & unified loader with 0–255 display rescale
+    # File loading and metadata-only calibration recovery
     # -----------------------------------------------------------------
 
+
+    def _initialise_controls_for_imported_layer(self, layer) -> None:
+        """Bring the panel's controls in line with a newly imported layer.
+
+        Shared by every entry point that does not go through
+        ``_apply_loaded_layers``: the drop handler and the startup sweep. They
+        previously each did their own subset, and the startup path did none of
+        it, so opening ``napari image.tif`` and then the panel left the Z range
+        at start == end == 0 — which makes ``_extract_current_2d_or_3d`` hand a
+        single plane to a 2D filter, and collapses a time series to frame 0.
+
+        Deliberately does not touch ``group_id`` or ``_group_layers``: minting
+        a group per imported layer would make ``_segmentation_raw_candidates``
+        (which filters raw layers by the Frangi context's group, with no
+        exception) hide separately imported raw and response files from each
+        other.
+        """
+        self._set_ct_controls(T=_time_size_from_layer(layer), C=1)
+        self._set_z_range_for_data(layer)
+        self._configure_scale_bar(_get_units_from_layer(layer))
+        _safe_axis_labels(self.viewer, layer)
+        self._set_default_display_mode_for_imported_layer(layer)
 
     def _normalize_existing_layers_on_startup(self) -> None:
         """Synchronize controls without reloading or replacing existing image data."""
         if not getattr(self, "_disposed", False):
+            for layer in list(self.viewer.layers):
+                with suppress(OSError, ValueError, TypeError):
+                    self._maybe_normalize_dragdrop_layer(layer)
+            active = self.viewer.layers.selection.active
+            if active is not None and _get_source_from_layer(active):
+                self.path_edit.setText(_get_source_from_layer(active))
+            # Layers already open when the panel appears get the same control
+            # setup an imported layer gets; without it their Z/T ranges stay
+            # collapsed and 3D data is processed one plane at a time.
+            if active is not None and not _is_analysis_aux_layer(active):
+                with suppress(OSError, ValueError, TypeError, AttributeError):
+                    self._initialise_controls_for_imported_layer(active)
             self._update_info()
 
 
@@ -11746,37 +12010,84 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     # Device helpers
     # -----------------------------------------------------------------
 
-    def _populate_devices(self):
-        """Select lazily; availability is checked only when computation needs it."""
-        self.device_combo.clear()
-        self.device_combo.addItems(["auto", "cpu", "cuda", "mps"])
-        self.device_combo.setToolTip("Auto chooses an available GPU. Unavailable devices fall back to CPU.")
+    # Accelerators in the order they are preferred. CPU is always last and is
+    # always present, so the list is never empty.
+    _DEVICE_PRIORITY = ("cuda", "mps", "cpu")
 
-    def _resolve_device(self) -> str:
+    @staticmethod
+    def _device_is_available(name: str) -> bool:
+        if name == "cpu":
+            return True
         torch = _get_torch_module()
         if torch is None:
-            return "cpu"
+            return False
+        with suppress(RuntimeError, AssertionError, AttributeError):
+            if name == "cuda":
+                return bool(torch.cuda.is_available())
+            if name == "mps":
+                return bool(
+                    hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+                )
+        return False
+
+    def _populate_devices(self):
+        """List only usable devices, best first.
+
+        There is no "auto" entry: it was indistinguishable from the top item
+        here, and it hid which device a run actually used. Probing imports
+        torch, which is slow, so construction lists the platform's plausible
+        devices and `_prune_unavailable_devices` removes the ones that turn out
+        not to be there once the panel is up.
+        """
+        self.device_combo.clear()
+        plausible = [
+            name
+            for name in self._DEVICE_PRIORITY
+            if name != "mps" or sys.platform == "darwin"
+        ]
+        self.device_combo.addItems(plausible)
+        self.device_combo.setCurrentIndex(0)
+        self.device_combo.setToolTip(
+            "Compute device, best first. Checking for a GPU is deferred, so an "
+            "entry may disappear once availability is known."
+        )
+        QTimer.singleShot(0, self._prune_unavailable_devices)
+
+    def _prune_unavailable_devices(self) -> None:
+        """Drop devices torch reports as missing, keeping the best selection."""
+        combo = getattr(self, "device_combo", None)
+        if combo is None:
+            return
+        available = [
+            name for name in self._DEVICE_PRIORITY if self._device_is_available(name)
+        ]
+        listed = [str(combo.itemText(i)) for i in range(combo.count())]
+        if listed == available:
+            combo.setToolTip("Compute device, best first.")
+            return
+        previous = str(combo.currentText()).strip().lower()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(available)
+        index = combo.findText(previous)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setToolTip("Compute device, best first.")
+        if index < 0:
+            # The prior selection is gone, so the effective device changed.
+            self._on_device_changed()
+
+    def _resolve_device(self) -> str:
         requested = ""
         with suppress(AttributeError, RuntimeError):
             requested = str(self.device_combo.currentText()).strip().lower()
-        if requested == "cpu":
-            return "cpu"
-        if requested == "cuda":
-            with suppress(RuntimeError, AssertionError, AttributeError):
-                if torch.cuda.is_available():
-                    return "cuda"
-            return "cpu"
-        if requested == "mps":
-            with suppress(RuntimeError, AssertionError, AttributeError):
-                if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    return "mps"
-            return "cpu"
-        with suppress(RuntimeError, AssertionError, AttributeError):
-            if torch.cuda.is_available():
-                return "cuda"
-        with suppress(RuntimeError, AssertionError, AttributeError):
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                return "mps"
+        if requested and self._device_is_available(requested):
+            return requested
+        # A stale selection (or no combo yet) falls back down the priority list
+        # rather than jumping straight to CPU.
+        for name in self._DEVICE_PRIORITY:
+            if self._device_is_available(name):
+                return name
         return "cpu"
 
     # -----------------------------------------------------------------
@@ -11784,14 +12095,15 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     # -----------------------------------------------------------------
 
     def _open_image_tc_zyx(self):
-        dlg = QFileDialog(self, "Open image")
-        dlg.setFileMode(QFileDialog.ExistingFile)
-        dlg.setNameFilter(
-            "Images (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)"
+        # The static helper owns and releases each modal/native dialog. Keeping
+        # parent-owned QFileDialog instances alive across imports can leave
+        # stale native panels when the user opens a second file on macOS.
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open image", "",
+            "Images (*.tif *.tiff *.png *.jpg *.jpeg);;All files (*)",
         )
-        if not dlg.exec_():
+        if not path:
             return
-        path = dlg.selectedFiles()[0]
         try:
             self._load_and_add_path(path)
         except (OSError, ValueError, TypeError, RuntimeError) as e:
@@ -11803,11 +12115,39 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             return
         if bool((getattr(layer, "metadata", {}) or {}).get("managed_by_plugin")):
             return
+        # Units must be right before the canvas draws, so this part cannot wait
+        # for the deferred repair below. See _presync_dragdrop_layer_units.
+        try:
+            self._presync_dragdrop_layer_units(layer)
+        except Exception:
+            _log.exception("Could not pre-set units for layer %r",
+                           getattr(layer, "name", layer))
 
         def _deferred():
-            with suppress(Exception):
+            if self._disposed or layer not in self.viewer.layers:
+                # Nothing will consume the memoised calibration now.
+                self._pending_layer_calibration.pop(id(layer), None)
+                return
+            try:
                 self._maybe_normalize_dragdrop_layer(layer)
+            except Exception:
+                # Best-effort repair: never block layer insertion. Log the
+                # reason, because an uncalibrated layer is otherwise silent and
+                # indistinguishable from a file with no calibration at all.
+                _log.exception("Could not recover calibration for layer %r",
+                               getattr(layer, "name", layer))
+            source = getattr(layer, "source", None)
             is_analysis_aux = _is_analysis_aux_layer(layer)
+            if (getattr(source, "path", None) and getattr(source, "parent", None) is None
+                    and layer is self.viewer.layers.selection.active):
+                if not is_analysis_aux:
+                    # A dropped file is a fresh import: clear state derived
+                    # from the previous one, as the Open File path does, so a
+                    # stale _median_layer or _frangi_ctx cannot pair the new
+                    # image with the old file's results.
+                    self._reset_processing_state()
+                    self._initialise_controls_for_imported_layer(layer)
+                self._select_imported_raw_layer(layer)
             if not is_analysis_aux:
                 self._view_initialized = False
                 self._fit_view_and_scalebar()
@@ -11815,13 +12155,104 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
 
         QTimer.singleShot(0, _deferred)
 
+    def _dragdrop_calibration_source(self, layer) -> str | None:
+        """The file whose calibration may be applied to ``layer``, if any.
+
+        A user-selected third-party reader, existing calibration/provenance
+        metadata, or a non-default transform is authoritative. Never infer
+        calibration for programmatically added or derived layers merely
+        because they carry an old source filename. Unrelated annotations from
+        other plugins are not a reason to skip an uncalibrated layer, so only
+        the keys that would be overwritten are treated as authoritative.
+        """
+        src = _get_source_from_layer(layer)
+        source = getattr(layer, "source", None)
+        if (getattr(source, "reader_plugin", None) != "napari" or
+                getattr(source, "parent", None) is not None or not src or
+                not isinstance(layer, NapariImage) or layer.rgb or layer.multiscale or
+                _AUTHORITATIVE_LAYER_METADATA & set(layer.metadata or ()) or
+                not np.array_equal(layer.scale, np.ones(layer.ndim)) or
+                not np.array_equal(layer.translate, np.zeros(layer.ndim)) or
+                not np.array_equal(layer.rotate, np.eye(layer.ndim)) or
+                np.any(layer.shear) or
+                not np.array_equal(layer.affine.affine_matrix, np.eye(layer.ndim + 1))):
+            return None
+        return src
+
+    def _read_dragdrop_calibration(self, layer, src: str):
+        """Read (and memoise) the calibration for one inserted layer."""
+        cached = self._pending_layer_calibration.get(id(layer))
+        if cached is not None:
+            return cached.get("calibration")
+        from ._image_io import read_tiff_layer_calibration
+        calibration = read_tiff_layer_calibration(os.fspath(src), tuple(layer.data.shape))
+        # Keep a strong reference to the layer so id() cannot be recycled onto
+        # a different object before the deferred pass reads this back.
+        self._pending_layer_calibration[id(layer)] = {
+            "layer": layer, "calibration": calibration,
+        }
+        return calibration
+
+    def _presync_dragdrop_layer_units(self, layer) -> None:
+        """Give an inserted layer its units before the canvas first draws.
+
+        The rest of the repair is deferred to the next event-loop iteration,
+        because setting ``scale`` during the insertion notification can hit
+        napari 0.9's TransformChain weak-callback teardown, and because the
+        surrounding UI work must not run reentrantly. Units cannot wait:
+        napari checks unit consistency on draw, so a layer that is still on
+        the default "pixel" when that draw happens makes napari report
+        "Inconsistent units across layers; units will not be used for
+        rendering" and drop physical units viewer-wide. Importing several
+        calibrated files therefore warned once per file after the first, even
+        though every file declared micrometres. Assigning ``units`` touches no
+        transform cache, so it is safe to do here.
+        """
+        if not hasattr(NapariLabels, "units"):
+            return
+        src = self._dragdrop_calibration_source(layer)
+        if not src:
+            return
+        calibration = self._read_dragdrop_calibration(layer, src)
+        if calibration is None:
+            return
+        units = _metadata_units_for_ndim(calibration["metadata"], layer.ndim)
+        if units is not None:
+            with suppress(Exception):
+                layer.units = units
+
     def _maybe_normalize_dragdrop_layer(self, layer):
-        """Respect in-memory data, including edits made by other plugins."""
+        """Fill missing native-reader calibration without replacing image data."""
         src = _get_source_from_layer(layer)
         if src:
             self.path_edit.setText(src)
-        # File loading is handled by the registered reader. An insertion event
-        # is not permission to replace a layer from its original file.
+        eligible = self._dragdrop_calibration_source(layer)
+        if not eligible:
+            self._pending_layer_calibration.pop(id(layer), None)
+            return
+        calibration = self._read_dragdrop_calibration(layer, eligible)
+        self._pending_layer_calibration.pop(id(layer), None)
+        if calibration is not None:
+            # napari 0.9 clears cached TransformChains while notifying their
+            # weak callbacks. Keep these objects alive through the public scale
+            # setter, otherwise an already displayed layer can raise a
+            # ReferenceError mid-notification. Do not change or block the cache
+            # or signals; all normal extent/renderer updates must still run.
+            transforms = getattr(layer, "_transforms", None)
+            cached_transforms = list(getattr(transforms, "_cache_dict", {}).values())
+            try:
+                layer.scale = calibration["scale"]
+            finally:
+                cached_transforms.clear()
+            layer.metadata = calibration["metadata"]
+            # Set the unit in the same repair, not later from the scale bar.
+            # A layer left on napari's default unit while its neighbours are
+            # calibrated is what makes napari report inconsistent units and
+            # stop rendering them.
+            units = _metadata_units_for_ndim(calibration["metadata"], layer.ndim)
+            if units is not None:
+                with suppress(Exception):
+                    layer.units = units
 
     # -----------------------------------------------------------------
     # Viewer sync & UI updates
@@ -11924,7 +12355,7 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                     str(getattr(layer, "_type_string", "")),
                     shape,
                     str(getattr(data, "dtype", "")),
-                    str(md.get("dims") or md.get("dims_out") or ""),
+                    _dims_tag_from_metadata(md),
                     str(md.get("layer_type") or ""),
                     tuple(bool(md.get(key)) for key in _LAYER_COMBO_METADATA_KEYS),
                 )
@@ -11955,9 +12386,38 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         self._rebuild_segmentation_layer_combos()
         self._layer_combo_state = state
 
+    def _forget_removed_layer_references(self, removed_layer) -> None:
+        """Drop cached handles to a layer that is no longer in the viewer.
+
+        Nothing else clears these, so "Apply rescale" would keep writing to a
+        detached layer: the assignment succeeds, the label still names it, and
+        the visible response never changes.
+        """
+        if removed_layer is None:
+            return
+        for attribute in ("_frangi_layer", "_segmentation_layer", "_denoise_layer",
+                          "_median_layer", "_gaussian_layer", "_upsample_layer"):
+            if getattr(self, attribute, None) is removed_layer:
+                setattr(self, attribute, None)
+        components = getattr(self, "_frangi_component_layers", None)
+        if isinstance(components, dict):
+            for name in [key for key, value in components.items() if value is removed_layer]:
+                components.pop(name, None)
+                if isinstance(getattr(self, "_frangi_component_raw", None), dict):
+                    self._frangi_component_raw.pop(name, None)
+                if isinstance(getattr(self, "_frangi_component_specs", None), dict):
+                    self._frangi_component_specs.pop(name, None)
+        events = getattr(self, "_tracking_event_layers", None)
+        if isinstance(events, dict):
+            for kind in [key for key, value in events.items() if value is removed_layer]:
+                events.pop(kind, None)
+
     def _update_info(self, event=None, *, update_preview: bool = True):
         self._refresh_gaussian_button_state()
         removed_layer = getattr(event, "value", None)
+        if removed_layer is not None and removed_layer not in self.viewer.layers:
+            with suppress(Exception):
+                self._forget_removed_layer_references(removed_layer)
         removed_metadata = getattr(removed_layer, "metadata", {}) or {}
         prefer_denoised = bool(
             removed_metadata.get("is_frangi")
@@ -12213,18 +12673,12 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                     with suppress(Exception):
                         self.viewer.layers.remove(layer_item)
             self._clear_analysis_results(reset_outputs=True)
-            self._load_and_add_path(src)
-            current = self.viewer.layers.selection.active
-            if current is not None and _get_source_from_layer(current) == src:
-                src_group = _get_group_id(current)
-                for layer_item in list(self.viewer.layers):
-                    if not hasattr(layer_item, "data"):
-                        continue
-                    if _is_analysis_aux_layer(layer_item):
-                        continue
-                    if src_group is not None and _get_group_id(layer_item) == src_group:
-                        with suppress(Exception):
-                            self.viewer.layers.remove(layer_item)
+            # The sliced array was already read above, so add it directly.
+            # This used to call _load_and_add_path(src) first, which read the
+            # whole file a second time and added full-range layers only to
+            # delete them again on the next few lines — a wasted multi-GB read,
+            # a visible flash, and a window in which an exception left the
+            # user's original layers already removed and nothing put back.
             self._apply_loaded_layers(data_tc_zyx, meta, name=self._next_layer_name(os.path.basename(src)))
         except (OSError, ValueError, TypeError, RuntimeError) as e:
             QMessageBox.critical(self, "Range apply failed", f"Failed to apply selected ranges: {e!r}")
@@ -12488,7 +12942,11 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 if squeeze_time:
                     scale = scale_all[-3:]
 
-            elif dims_tag in {"ZYX", None}:
+            else:
+                # Also the fallback for an unrecognised dims tag. That case
+                # used to be a separate copy of this branch that never called
+                # _selected_slice_range(), so the user's Z range was silently
+                # discarded and the whole volume was filtered instead.
                 vol = arr if arr.ndim == 3 else self._current_volume_from_layer(base_layer)
                 z0, z1 = self._selected_slice_range()
                 nz = vol.shape[0] if vol.ndim == 3 else 1
@@ -12508,19 +12966,6 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                         denoise_input = vol[zstart : zend + 1]
                         scale = tuple(float(v) for v in base_layer.scale[-3:])
                         dims_out = "ZYX"
-                elif vol.ndim == 2:
-                    denoise_input = vol
-                    scale = tuple(float(v) for v in base_layer.scale[-2:])
-                    dims_out = "YX"
-                else:
-                    raise ValueError(f"Unsupported data ndim for denoise: {vol.ndim}")
-
-            else:
-                vol = self._current_volume_from_layer(base_layer)
-                if vol.ndim == 3:
-                    denoise_input = vol
-                    scale = tuple(float(v) for v in base_layer.scale[-3:])
-                    dims_out = "ZYX"
                 elif vol.ndim == 2:
                     denoise_input = vol
                     scale = tuple(float(v) for v in base_layer.scale[-2:])
@@ -12583,7 +13028,14 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                 )
                 if dims_tag in {"TYX", "TZYX"}:
                     md["time_range"] = self._selected_time_range()
-                denoise_kwargs = {"name": name, "scale": scale, "metadata": md}
+                # Carry the source offset like the upsample and Gaussian paths
+                # do; without it a median result of a translated layer no
+                # longer overlays the image it came from.
+                translate_all = tuple(
+                    float(v) for v in getattr(base_layer, "translate", (0.0,) * out.ndim)
+                )
+                denoise_kwargs = {"name": name, "scale": scale, "metadata": md,
+                                  "translate": translate_all[-out.ndim:]}
                 units = _spatial_units_for_ndim(base_layer, out.ndim)
                 if units is not None:
                     denoise_kwargs["units"] = units
@@ -12852,6 +13304,87 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
             cnt = 1
         return np.linspace(smin, smax, cnt, dtype=float).tolist()
 
+    def _effective_frangi_spatial_dim(self) -> tuple[int, int]:
+        """Predict (spatial dim, selected Z depth) for the next Frangi run.
+
+        Mirrors the decisions in `_extract_processing_series` /
+        `_extract_current_2d_or_3d` from shapes and spin values alone, without
+        slicing any pixels: this is called on every relevant UI change and the
+        source layer can be tens of gigabytes. Returns dim 3 when it cannot
+        tell, so an unrecognised layout never hides a mode the user could use.
+        """
+        layer = self._selected_frangi_raw_layer() or self.viewer.layers.selection.active
+        data = getattr(layer, "data", None)
+        shape = tuple(int(value) for value in getattr(data, "shape", ()) or ())
+        if not shape:
+            return 3, 0
+        dims_tag = _layer_dims_tag(layer) if layer is not None else ""
+        if not dims_tag and len(shape) == 4:
+            dims_tag = "TZYX"
+        if dims_tag == "TYX":
+            return 2, 1
+        if dims_tag == "TZYX":
+            # Whether the time range selects one frame or many, the result is
+            # 3D over the full Z extent: the Z range is not applied on this
+            # branch, so the time spins do not affect the answer.
+            return 3, int(shape[-3])
+        # ZYX / YX / unlabelled: the Z range *is* applied here.
+        squeezed = [size for size in shape if size > 1] or [1]
+        if len(squeezed) < 3:
+            return 2, 1
+        z_size = int(shape[-3])
+        z0, z1 = self._selected_slice_range()
+        zstart = max(0, min(z0, z_size - 1))
+        zend = max(zstart, min(max(z0, z1), z_size - 1))
+        if zstart == zend:
+            return 2, 1
+        return 3, int(zend - zstart + 1)
+
+    def _refresh_frangi_response_mode_availability(self, *_args) -> None:
+        """Offer sheetness only when the filter will actually be 3D.
+
+        Sheetness separates one strong normal curvature from two weak
+        tangential ones, which needs three Hessian eigenvalues. A 2D filter has
+        two, so the response would silently be vesselness under a "sheetness"
+        label. Rather than compute it and warn afterwards, the modes that
+        cannot be honoured are disabled, with the reason in their tooltip.
+        """
+        combo = getattr(self, "frangi_response_mode_combo", None)
+        if combo is None:
+            return
+        dim, z_depth = self._effective_frangi_spatial_dim()
+        kernel_radius = int(self.kernel_spin.value()) if hasattr(self, "kernel_spin") else 0
+        # z_depth 0 means the depth is unknown (no layer selected yet), which
+        # must not read as "too thin" and disable a mode the user can use.
+        thin_z = dim == 3 and 0 < z_depth <= kernel_radius
+        available = dim == 3 and not thin_z
+        if available:
+            reason = ""
+        elif thin_z:
+            reason = (
+                f"Needs a 3D filter: the selected Z depth is {z_depth} plane(s), "
+                f"which is not more than the kernel radius ({kernel_radius}). "
+                "Select a deeper Z range or reduce the kernel radius."
+            )
+        else:
+            reason = (
+                "Needs a 3D filter: the selected data is two-dimensional "
+                "(2D image, single Z slice, or a TYX series)."
+            )
+        model = combo.model()
+        for index in range(combo.count()):
+            if str(combo.itemData(index)) not in {"sheetness", "combined"}:
+                continue
+            combo.setItemData(index, reason or None, Qt.ToolTipRole)
+            item = model.item(index) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(available)
+        if not available and str(combo.currentData()) in {"sheetness", "combined"}:
+            fallback = combo.findData("vesselness")
+            if fallback >= 0:
+                combo.setCurrentIndex(fallback)
+        combo.setToolTip(reason or "")
+
     def _on_frangi_response_mode_changed(self, *_args) -> None:
         mode = str(self.frangi_response_mode_combo.currentData() or "vesselness")
         vessel_visible = mode in {"vesselness", "combined"}
@@ -12875,6 +13408,45 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
     def _frangi_rescale_is_enabled(self) -> bool:
         checkbox = getattr(self, "frangi_rescale_checkbox", None)
         return True if checkbox is None else bool(checkbox.isChecked())
+
+    def _restore_component_raw_data(self) -> bool:
+        """Put the unrescaled response back into every component layer.
+
+        ``_frangi_component_raw`` keeps the response as computed, so clearing
+        the checkbox can be undone. It previously could not: toggling only ran
+        ``_refresh_frangi_rescale_controls_state``, which enables and disables
+        widgets and never touches layer data, so an applied rescale stayed on
+        screen and in the layer while the UI claimed it was off.
+        """
+        raw_components = getattr(self, "_frangi_component_raw", {}) or {}
+        component_layers = getattr(self, "_frangi_component_layers", {}) or {}
+        restored = False
+        for component_name, raw in raw_components.items():
+            if component_name not in component_layers or raw is None:
+                continue
+            self._update_component_layer_data(
+                component_name, np.asarray(raw, dtype=np.float32)
+            )
+            spec = self._frangi_component_specs.setdefault(component_name, {})
+            spec["rescale_enabled"] = False
+            restored = True
+        # "combined max" is derived, so recompute it from the raw components
+        # rather than leaving the rescaled maximum behind.
+        if "vesselness" in raw_components and "sheetness" in raw_components:
+            vessel = np.asarray(raw_components["vesselness"], dtype=np.float32)
+            sheet = np.asarray(raw_components["sheetness"], dtype=np.float32)
+            if vessel.shape == sheet.shape:
+                self._update_component_layer_data(
+                    "combined max", np.maximum(vessel, sheet)
+                )
+                restored = True
+        return restored
+
+    def _on_frangi_rescale_toggled(self, checked: bool) -> None:
+        if not checked:
+            with suppress(Exception):
+                self._restore_component_raw_data()
+        self._refresh_frangi_rescale_controls_state()
 
     def _refresh_frangi_rescale_controls_state(self, *_args) -> None:
         enabled = self._frangi_rescale_is_enabled()
@@ -13285,6 +13857,32 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         img_shape = tuple(int(value) for value in img.shape)
         z_depth = int(img_shape[-3]) if dim == 3 and len(img_shape) >= 3 else 1
         process_z_as_2d = dim == 3 and z_depth <= int(self.kernel_spin.value())
+        # Sheetness needs three Hessian eigenvalues. Whenever the filter ends
+        # up two-dimensional — genuinely 2D data, a single selected Z slice, a
+        # TYX series, or a Z extent too thin to filter in 3D — the sheetness
+        # branch can only return vesselness. The combo disables those modes
+        # in that case (`_refresh_frangi_response_mode_availability`); this is
+        # the backstop for a selection that slipped through, e.g. state that
+        # changed between the last refresh and this click.
+        if frangi_response_mode in {"sheetness", "combined"} and (
+            dim == 2 or process_z_as_2d
+        ):
+            reason = (
+                f"the Z extent is {z_depth} plane(s), too thin to filter in 3D "
+                f"with kernel {2 * int(self.kernel_spin.value()) + 1}"
+                if process_z_as_2d
+                else "the selected data is two-dimensional"
+            )
+            self._refresh_frangi_response_mode_availability()
+            QMessageBox.warning(
+                self,
+                "Sheetness unavailable in 2D",
+                f"Sheetness requires three Hessian eigenvalues, but {reason}, so "
+                "only two are available.\n\n"
+                "Choose vesselness, or select a Z range deeper than the kernel "
+                "radius.",
+            )
+            return
         logical_units = (
             int(img.shape[0]) * z_depth
             if temporal_dims and process_z_as_2d
@@ -13348,23 +13946,38 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
                     "Extraction failed",
                     f"Structural awareness extraction error: {error!r}",
                 )
-            else:
-                self.frangi_progress.setRange(0, 1)
-                self.frangi_progress.setValue(1)
-                self.frangi_progress.setFormat("Finished")
-                self._add_frangi_result(
-                    layer,
-                    img,
-                    frangi_result_raw,
-                    dim,
-                    device,
-                    temporal_dims,
-                    response_specs,
-                    frangi_response_mode,
+            try:
+                if error is None:
+                    self.frangi_progress.setRange(0, 1)
+                    self.frangi_progress.setValue(1)
+                    self.frangi_progress.setFormat("Finished")
+                    self._add_frangi_result(
+                        layer,
+                        img,
+                        frangi_result_raw,
+                        dim,
+                        device,
+                        temporal_dims,
+                        response_specs,
+                        frangi_response_mode,
+                    )
+            except Exception:
+                # Building the result layers must not strand the thread.
+                # Without this the cleanup below is skipped, thread.quit() is
+                # never called, and _thread_is_running stays True forever, so
+                # the button is stuck reading "Stop Extraction".
+                self.frangi_progress.setFormat("Failed")
+                _log.exception("Could not add the structural response layers")
+                QMessageBox.critical(
+                    self,
+                    "Extraction failed",
+                    "The response was computed but its layers could not be created. "
+                    "See the log for details.",
                 )
-            self._cleanup_worker_thread("_frangi_thread", "_frangi_worker")
-            self.frangi_rescale_checkbox.setEnabled(True)
-            self._refresh_frangi_rescale_controls_state()
+            finally:
+                self._cleanup_worker_thread("_frangi_thread", "_frangi_worker")
+                self.frangi_rescale_checkbox.setEnabled(True)
+                self._refresh_frangi_rescale_controls_state()
 
         self._connect_worker_callback(self._frangi_worker.finished, _finished)
         self._frangi_thread.start()
@@ -13429,7 +14042,22 @@ class SIGMAWidget(SegmentAnalysisMixin, QWidget):
         base_md["frangi_rescale_enabled"] = any(
             bool(spec.get("rescale_enabled")) for spec in response_specs
         )
-        base_md["group_id"] = _get_group_id(layer) or _ensure_group_id(base_md)
+        # No `frangi_sheetness_substituted` is written here: sheetness and
+        # combined are unselectable unless the filter really runs in 3D, so a
+        # substitution cannot reach this point. The key is still read back
+        # (_metadata.SIGMA_TIFF_METADATA_KEYS) for files written before that.
+        group_id = _get_group_id(layer) or _ensure_group_id(base_md)
+        base_md["group_id"] = group_id
+        # The raw layer has to join the same group, not just the response.
+        # _segmentation_raw_candidates() filters raw layers by the Frangi
+        # context's group with no exception, so a source layer that arrived by
+        # drag-and-drop (hence has no group of its own) would otherwise be
+        # hidden from the segmentation combo as soon as the context exists.
+        # _ensure_frangi_context_from_selected_layers does the same write-back.
+        if _get_group_id(layer) != group_id:
+            raw_md = dict(getattr(layer, "metadata", {}) or {})
+            raw_md["group_id"] = group_id
+            layer.metadata = raw_md
 
         sc = getattr(layer, "scale", (1,) * layer.data.ndim)
         if temporal_dims == "TYX":

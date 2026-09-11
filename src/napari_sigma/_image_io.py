@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import suppress
 from typing import Any
 from xml.etree import ElementTree
@@ -9,8 +10,10 @@ import numpy as np
 import tifffile
 from PIL import Image
 
+from ._metadata import SIGMA_TIFF_METADATA_KEYS
 from ._nis_tiff import read_nis_elements_tiff_metadata
 
+_log = logging.getLogger(__name__)
 SUPPORTED_IMAGE_SUFFIXES = (".tif", ".tiff", ".png", ".jpg", ".jpeg")
 _UNIT_TO_UM = {
     "um": 1.0,
@@ -262,6 +265,79 @@ def _is_probable_time_series(imagej_meta: dict[str, Any] | None) -> bool:
     if first.startswith("t:"):
         return True
     return False
+
+
+def read_tiff_layer_calibration(path: str, shape: tuple[int, ...]) -> dict[str, Any] | None:
+    """Read missing calibration for a native napari TIFF layer, never pixels.
+
+    Returns None for anything that cannot be calibrated safely, and never
+    raises: an unreadable or unusual file must not interrupt layer insertion.
+    The reason is logged, because a silently uncalibrated layer is otherwise
+    indistinguishable from a file that genuinely carries no calibration.
+    """
+    try:
+        return _tiff_layer_calibration(path, shape)
+    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError) as error:
+        # _interpret_tiff_axes raises on layouts it cannot resolve, and
+        # tifffile raises on damaged files; both mean "no calibration here".
+        _log.info("No TIFF calibration recovered for %s: %r", path, error)
+        return None
+
+
+def _tiff_layer_calibration(path: str, shape: tuple[int, ...]) -> dict[str, Any] | None:
+    """Calibration for one native TIFF layer; may raise, see the wrapper.
+
+    Only a matching, single-channel layout is safe to annotate in place. Crops,
+    axis permutations, RGB data and ambiguous layouts must not borrow the source
+    file's geometry. The caller additionally protects explicit layer transforms.
+    """
+    if not path.lower().endswith((".tif", ".tiff")):
+        return None
+    with tifffile.TiffFile(path) as tif:
+        if len(tif.series) != 1:
+            return None
+        series = tif.series[0]
+        if tuple(series.shape) != tuple(shape):
+            return None
+        original_axes = str(series.axes).upper()
+        shaped = tif.shaped_metadata or ()
+        imagej_meta = dict(shaped[0] or {}) if shaped else {}
+        imagej_meta.update(tif.imagej_metadata or {})
+        axes, assumptions = _interpret_tiff_axes(original_axes, len(shape), imagej_meta)
+        if axes not in {"YX", "ZYX", "TYX", "TZYX"}:
+            return None
+        page = tif.pages[0]
+        ome_sizes, _ = _read_ome_pixels_metadata(tif.ome_metadata)
+        nis_xy_size, _ = read_nis_elements_tiff_metadata(page)
+        resolution_unit = getattr(page.tags.get("ResolutionUnit"), "value", None)
+        # Unitless resolution=1 is a TIFF default, not evidence of 1 um pixels.
+        has_calibration = (
+            bool(ome_sizes) or nis_xy_size is not None or resolution_unit in (2, 3)
+            or (bool(imagej_meta.get("unit"))
+                and _normalize_unit_name(imagej_meta["unit"]) in _UNIT_TO_UM)
+        )
+        if not has_calibration:
+            return None
+    zyx_scale, unit, extras = _read_tiff_scale_metadata(path)
+    if not all(np.isfinite(value) and value > 0 for value in zyx_scale):
+        return None
+    axis_scale = dict(zip("TCZYX", (1.0, 1.0, *zyx_scale)))
+    metadata = {
+        "dims": axes, "dims_out": axes, "inferred_dims": axes,
+        "axes": original_axes, "storage_dims": axes, "source": path,
+        "unit": unit, "scale_per_axis": (1.0, 1.0, *zyx_scale),
+        "sigma_calibration_source": "tiff_metadata",
+    }
+    # Acquisition timing, plus whatever role the file states about itself. The
+    # role keys can only have come from a sigma_metadata block, which only
+    # SIGMA's own writer emits, so restoring them is not inventing a role for
+    # an arbitrary image: a saved Frangi response stays a Frangi response even
+    # when napari's built-in reader is the one that opened it.
+    carried = ("time_interval", "finterval", "fps") + SIGMA_TIFF_METADATA_KEYS
+    metadata.update({key: extras[key] for key in carried if key in extras})
+    if assumptions:
+        metadata["axis_assumptions"] = assumptions
+    return {"scale": tuple(axis_scale[axis] for axis in axes), "metadata": metadata}
 
 
 def _interpret_tiff_axes(
