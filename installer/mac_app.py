@@ -108,6 +108,14 @@ def sign_app(app):
     run(["/usr/bin/codesign", "--verify", "--deep", "--strict", app])
 
 
+def create_dmg(staging, dmg):
+    # macOS 14+ supports APFS. Avoid the legacy HFS+ creation path, which
+    # stalled on the Intel macOS 15 runner; retain verbose output and bound
+    # this OS utility so a filesystem/runner fault cannot wait indefinitely.
+    run(["/usr/bin/hdiutil", "create", "-volname", "SIGMA", "-srcfolder", staging,
+         "-format", "UDZO", "-fs", "APFS", "-nospotlight", "-verbose", dmg], timeout=900)
+
+
 def build_app(target, version, work, payload, output):
     record = runtime_record(target)
     archive = checked_archive(work / "portable-python-cache", record)
@@ -165,8 +173,7 @@ def build_app(target, version, work, payload, output):
     shutil.copy2(HERE / "QUICKSTART.txt", staging / "READ ME.txt")
     arch = "AppleSilicon" if target == "osx-arm64" else "Intel"
     dmg = output / f"SIGMA-{version}-macOS-{arch}-unsigned.dmg"
-    run(["/usr/bin/hdiutil", "create", "-volname", "SIGMA", "-srcfolder", staging,
-         "-format", "UDZO", "-fs", "HFS+", dmg])
+    create_dmg(staging, dmg)
     with dmg.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     dmg.with_suffix(".dmg.sha256").write_text(f"{digest}  {dmg.name}\n", encoding="utf-8")

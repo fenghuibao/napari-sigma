@@ -93,6 +93,9 @@ hash-verified wheel set (and puts Windows constructor in offline mode). It requi
 the existing build/runtime/cache directories and refuses altered wheel files.
 Mac reuses a hash-checked Python archive cache but requires a fresh `mac-dmg`
 staging directory and output DMG path; existing apps are never silently overwritten.
+DMGs use APFS (supported by all target macOS versions). Disk-image creation emits
+verbose diagnostics and has a 15-minute timeout; a stalled OS utility is a failed
+build, never a distributable artifact. The CI retains failure diagnostics.
 Windows full builds require the standalone conda executable to run successfully;
 restricted sandbox semaphore failures must be resolved on a normal build runner,
 not treated as a successful build. SHA-256 files accompany the generated installers.

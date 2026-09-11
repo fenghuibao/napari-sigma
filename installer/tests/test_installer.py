@@ -28,6 +28,15 @@ mac_app = module("mac_app")
 
 
 class InstallerTests(unittest.TestCase):
+    def test_dmg_creation_has_diagnostics_and_a_bounded_timeout(self):
+        with patch.object(mac_app, "run") as run:
+            mac_app.create_dmg(Path("staging"), Path("SIGMA.dmg"))
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-fs") + 1], "APFS")
+        self.assertIn("-verbose", command)
+        self.assertIn("-nospotlight", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 900)
+
     def test_portable_python_archives_are_pinned_per_architecture(self):
         arm = mac_app.runtime_record("osx-arm64")
         intel = mac_app.runtime_record("osx-64")

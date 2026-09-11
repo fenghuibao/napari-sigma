@@ -45,6 +45,13 @@ jobs:
         run: python -m unittest discover -s installer/tests -v
       - name: Build offline installer
         run: python installer/build.py --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
+      - name: Collect failed macOS disk-image diagnostics
+        if: failure() && runner.os == 'macOS'
+        run: |
+          mkdir -p dist-desktop/diagnostics
+          hdiutil info > dist-desktop/diagnostics/disk-images.txt
+          df -h > dist-desktop/diagnostics/disk-space.txt
+          ps -axo pid,ppid,etime,%cpu,comm > dist-desktop/diagnostics/processes.txt
       - name: Verify read-only DMG, relocated macOS app and deletion uninstall
         if: runner.os == 'macOS'
         run: python installer/ci_macos_app.py --dmg dist-desktop/*.dmg --build-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop/verification
