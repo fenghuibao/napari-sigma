@@ -1,6 +1,7 @@
 """Native-reader TIFF calibration must not require reloading image pixels."""
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -113,13 +114,25 @@ class NativeTiffCalibration(unittest.TestCase):
             panel.dispose()
 
     def test_removed_layer_is_not_annotated_by_pending_drop_callback(self):
-        self.panel()
+        panel = self.panel()
         self.App.processEvents()
         layer = self.viewer.open(self.path, plugin="napari")[0]
+        # Opening may already process events (and calibrate the layer) on some
+        # Qt/platform combinations. Queue the callback explicitly so removal
+        # always precedes the callback under test, independent of that timing.
+        pending = []
+        with patch("napari_sigma._widget.QTimer.singleShot",
+                   side_effect=lambda delay, callback: pending.append(callback)):
+            panel._on_layer_inserted(SimpleNamespace(value=layer))
+        metadata, scale = dict(layer.metadata), layer.scale.copy()
         self.viewer.layers.remove(layer)
-        self.App.processEvents()
-        self.assertFalse(layer.metadata)
-        np.testing.assert_array_equal(layer.scale, (1, 1, 1, 1))
+        self.assertEqual(len(pending), 1)
+        with patch.object(panel, "_maybe_normalize_dragdrop_layer") as normalize:
+            pending[0]()
+            self.App.processEvents()
+            normalize.assert_not_called()
+        self.assertEqual(layer.metadata, metadata)
+        np.testing.assert_array_equal(layer.scale, scale)
 
     def test_cropped_layer_cannot_borrow_original_geometry(self):
         layer = self.viewer.open(self.path, plugin="napari")[0]
