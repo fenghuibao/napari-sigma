@@ -24,9 +24,46 @@ def module(name):
 
 
 build, install, launch, verify = (module(name) for name in ("build", "install", "launch", "verify"))
+mac_app = module("mac_app")
 
 
 class InstallerTests(unittest.TestCase):
+    def test_portable_python_archives_are_pinned_per_architecture(self):
+        arm = mac_app.runtime_record("osx-arm64")
+        intel = mac_app.runtime_record("osx-64")
+        self.assertEqual(arm["python"], "3.13.15")
+        self.assertEqual(intel["python"], "3.11.16")
+        for record in (arm, intel):
+            self.assertTrue(record["url"].startswith("https://github.com/astral-sh/python-build-standalone/releases/download/20260901/"))
+            self.assertRegex(record["sha256"], r"^[0-9a-f]{64}$")
+            self.assertNotIn("freethreaded", record["filename"])
+
+    def test_changed_python_archive_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "runtime.tar.zst"
+            archive.write_bytes(b"runtime")
+            mac_app.check_digest(archive, hashlib.sha256(b"runtime").hexdigest())
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                mac_app.check_digest(archive, "0" * 64)
+
+    @unittest.skipIf(sys.platform == "win32", "macOS symlink layout")
+    def test_bundle_cannot_link_to_external_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "python3").write_bytes(b"python")
+            (root / "python").symlink_to("python3")
+            mac_app.check_internal_links(root)
+            (root / "external").symlink_to("/Library/sigma-0.0.5")
+            with self.assertRaisesRegex(ValueError, "external or broken"):
+                mac_app.check_internal_links(root)
+
+    def test_native_bundle_name_has_no_version_or_absolute_executable(self):
+        plist = plistlib.loads(plistlib.dumps(mac_app.app_plist("0.0.5")))
+        self.assertEqual(plist["CFBundleName"], "SIGMA")
+        self.assertEqual(plist["CFBundleDisplayName"], "SIGMA")
+        self.assertEqual(plist["CFBundleExecutable"], "SIGMA")
+        self.assertEqual(plist["CFBundleVersion"], "0.0.5")
+
     def test_platform_versions(self):
         intel = build.requirements("osx-64")
         self.assertIn("numpy==1.26.4", intel)

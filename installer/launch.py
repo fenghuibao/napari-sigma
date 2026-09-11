@@ -159,6 +159,8 @@ def main(argv=None) -> int:
         splash.finish(viewer.window._qt_window)
         app.processEvents()
         if args.smoke_test:
+            if panel._desktop_full_name.text() != desktop.FULL_NAME or not panel._desktop_full_name.isVisible():
+                raise RuntimeError("The full SIGMA name must be visible in the panel")
             if app.applicationDisplayName() != "SIGMA" or viewer.window._qt_window.windowTitle() != "SIGMA":
                 raise RuntimeError("Application/window name must be SIGMA without a version suffix")
             if viewer.window._qt_window.windowIcon().cacheKey() != icon.cacheKey():

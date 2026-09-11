@@ -7,7 +7,9 @@ Source code: https://github.com/fenghuibao/napari-sigma
 This installer includes a private Python runtime and third-party open-source
 software, including napari, PyTorch, Qt/PyQt6, NumPy, SciPy and other libraries.
 Each dependency remains subject to its own license; upstream license and
-copyright files are retained in the bundled packages and wheel archives.
+copyright files are retained in the installed packages (and wheel archives on
+Windows). Mac additionally includes Python's upstream licenses and PYTHON.json
+under SIGMA.app/Contents/Resources. No duplicate wheel archives are needed on Mac.
 See bundle.json and requirements.lock for the exact package versions and hashes.
 
 This test installer is not Developer ID notarized or Windows Authenticode signed.

@@ -3,10 +3,13 @@
 Native, offline installers for the **unchanged published napari-sigma 0.0.5 wheel**.
 The desktop launcher opens napari and the SIGMA panel automatically. No terminal,
 Python installation, shell initialization, or administrator rights are needed for
-a per-user installation. macOS also offers installation for all users.
+a per-user installation. On macOS, drag the app from its DMG into Applications
+(or your personal Applications folder); delete the app to uninstall its runtime.
 
 Application and shortcut names are always **SIGMA**, without a version suffix.
-Internal bundle metadata, private runtime paths and installer filenames retain
+The panel shows **SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)**,
+using the author's exact spelling, with wrapping for narrow displays.
+Internal bundle metadata and installer filenames retain
 the core version for compatibility checks and diagnosis. The user-supplied
 `assets/sigma-logo-original.png` is retained. `prepare_logo.py` deterministically
 extracts the emblem, removes the lower wordmark and white exterior, and preserves
@@ -63,29 +66,41 @@ python installer/build.py --work-dir /path/to/empty-build-dir --output-dir dist-
 python -m unittest discover -s installer/tests -v
 ```
 
-The builder creates a separate minimal conda runtime. It downloads binary wheels,
-generates a SHA-256 requirements lock and manifest, then constructs a PKG/NSIS
-installer. Windows Torch is obtained only from PyTorch's official CPU index; the
-remaining wheels use PyPI. Installation uses `--no-index --require-hashes --no-deps`
-and runs `pip check` before creating shortcuts. Installation is fully offline.
-Wheel archives are retained for third-party licenses and diagnosis (additional disk
-space). Exact dependency resolutions are included beside and inside each artifact.
+The builder uses an isolated conda environment to download binary wheels and
+generate a SHA-256 requirements lock and font index. Windows retains its NSIS/conda
+installation workflow. Mac apps instead embed an official, relocatable
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone/releases/tag/20260901)
+runtime (Python 3.13.15 ARM / 3.11.16 Intel), pinned by archive SHA-256. The native
+launcher derives its runtime path from its own bundle and embeds Python using
+isolated PyConfig initialization. There is no conda-unpack step, first-run repair,
+external /Library runtime, PATH dependency, or write into the application bundle.
+Matplotlib/Numba caches and preferences remain per-user outside the app.
+
+Windows Torch is obtained only from PyTorch's official CPU index; other wheels use
+PyPI. Both platforms install wheels using `--no-index --require-hashes --no-deps`
+and run `pip check` (at build time for Mac, install time for Windows). End-user
+installation is fully offline. Windows retains the wheel archives. Mac retains
+installed package/license files plus the complete Python runtime license directory
+and upstream PYTHON.json; duplicate wheel archives are not shipped in the app.
+Exact dependency resolutions are included beside and inside each artifact.
 To intentionally update dependencies, build in a new work directory and re-test.
 
 The build runtime must remain conda-only until constructor has finished: do not
 install the wheelhouse into that environment manually. This keeps conda's package
 inventory complete. `--prepare-only` can be used to inspect payload/configuration.
 For launcher/configuration-only fixes, `--reuse-wheelhouse` reuses the previous
-hash-verified wheel set and puts constructor in offline mode. It requires the
-complete existing build/runtime/cache directories and refuses altered wheel files.
-Full builds also require the standalone conda executable to run successfully;
+hash-verified wheel set (and puts Windows constructor in offline mode). It requires
+the existing build/runtime/cache directories and refuses altered wheel files.
+Mac reuses a hash-checked Python archive cache but requires a fresh `mac-dmg`
+staging directory and output DMG path; existing apps are never silently overwritten.
+Windows full builds require the standalone conda executable to run successfully;
 restricted sandbox semaphore failures must be resolved on a normal build runner,
 not treated as a successful build. SHA-256 files accompany the generated installers.
 
 ## Verification and CI
 
 The dedicated `Desktop installers (unsigned)` workflow builds all three native
-targets, installs the actual generated installer in a disposable runner, and runs:
+targets, installs the actual generated artifact in a disposable runner, and runs:
 
 - private import-origin and dependency checks;
 - GUI startup, auto-opened SIGMA panel, and screenshot;
@@ -93,6 +108,11 @@ targets, installs the actual generated installer in a disposable runner, and run
 - CPU Frangi and segmentation smoke tests;
 - the existing core regression suite against the **installed wheel**, not `src/`;
 - shortcut existence/names, installed artwork, native icon and Windows uninstallation checks.
+- Mac native startup directly from the read-only DMG; copying and moving the app
+  to a path containing spaces and Unicode, with the original build directory
+  renamed/unavailable; full regression tests after ejecting the DMG; signature
+  verification before/after tests; deletion of the test app, confirming no runtime
+  was created in /Library or ~/Library. No real user's installation is deleted.
 - desktop GUI regressions for pending/failed imports, responsive tab changes,
   main-thread canvas creation, shared preparation, and closing during loading.
 - isolated cold-font tests for missing/corrupt caches, relocated installations,
@@ -115,13 +135,17 @@ record are included. The workflow does not upload to PyPI or create a public rel
 
 These are **unsigned test builds**. macOS Gatekeeper or Windows SmartScreen may
 block a downloaded installer. Do not instruct users to disable OS security.
-Production distribution needs the publisher's Apple Developer ID Installer and
-Application certificates/notarization, and a Windows Authenticode signing identity.
+Mac apps have an ad-hoc integrity signature for native execution, not an identified
+publisher signature or notarization. Production distribution needs the publisher's
+Apple Developer ID Application certificate/notarization and a Windows Authenticode
+signing identity. A Developer ID Installer certificate is not needed for this DMG.
 Neither secrets nor signing workarounds are embedded in this repository.
 
 Third-party components retain their own licenses in the installation and wheel
 archives. Review applicable redistribution requirements before public distribution.
 The included user guide describes supported platforms, logs and uninstalling.
-Close/uninstall an older desktop build before replacement: the stable SIGMA app
-name is shared across versions, so side-by-side shortcuts are no longer supported.
+Quit Mac SIGMA before replacing the app. Old PKG runtimes are deliberately not
+deleted or reused by this new layout; the guide describes their separate cleanup.
+Uninstall the previous Windows build before replacement. The stable SIGMA app name
+is shared across versions, so side-by-side shortcuts are not supported.
 Core Python-package publishing is independent of this build.

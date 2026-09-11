@@ -21,6 +21,15 @@ spec.loader.exec_module(desktop)
 
 
 class PlotPreparationTests(unittest.TestCase):
+    def test_full_name_is_exact_and_wraps_without_changing_app_name(self):
+        preparation = desktop.PlotPreparation(lambda: None)
+        viewer, panel = self.make_panel(preparation)
+        label = panel._desktop_full_name
+        self.assertEqual(label.text(), "SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)")
+        self.assertTrue(label.wordWrap())
+        self.assertIs(panel.layout().itemAt(0).widget(), label)
+        self.assertNotIn("0.0.5", label.text())
+
     def make_panel(self, preparation):
         viewer = napari.Viewer(show=False)
         panel = desktop.DesktopSIGMAWidget(viewer, plot_preparation=preparation)

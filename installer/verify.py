@@ -16,23 +16,43 @@ def run_smoke(python: Path, resources: Path, output: Path, env: dict):
     # The child keeps TIFF memory maps alive until GUI shutdown. In particular,
     # Windows cannot unlink them earlier. Cleanup errors must not be suppressed.
     with tempfile.TemporaryDirectory(prefix="sigma-smoke-") as directory:
-        command = [str(python), "-I", str(Path(__file__).resolve().parent / "font_tests/font_probe.py"),
+        command = [str(python), "-I", "-B", str(Path(__file__).resolve().parent / "font_tests/font_probe.py"),
                    "--launch", str(resources / "launch.py"), "--smoke-test",
                    "--smoke-data-dir", directory, "--screenshot", str(output / "desktop.png")]
         return subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               env=env, timeout=1200)
 
 
+def run_native_smoke(app: Path, output: Path, env: dict):
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sigma-native-smoke-") as directory:
+        command = [str(app / "Contents/MacOS/SIGMA"), "--smoke-test",
+                   "--smoke-data-dir", directory, "--screenshot", str(output / "desktop.png")]
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                env=env, timeout=1200)
+        (output / "native-launch.log").write_bytes(result.stdout)
+        print(result.stdout.decode("utf-8", errors="replace"), flush=True)
+        result.check_returncode()
+        if not (output / "desktop.png").is_file():
+            raise RuntimeError("Native app launch produced no screenshot")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prefix", type=Path, required=True)
+    location = parser.add_mutually_exclusive_group(required=True)
+    location.add_argument("--prefix", type=Path)
+    location.add_argument("--app", type=Path, help="Self-contained macOS application")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    prefix = args.prefix.resolve()
+    app = args.app.resolve() if args.app else None
+    prefix = app / "Contents/Resources/runtime" if app else args.prefix.resolve()
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     resources = prefix / "sigma-desktop"
     bundle = json.loads((resources / "bundle.json").read_text(encoding="utf-8"))
+    if app:
+        assert sys.platform == "darwin" and bundle["packaging"] == "self-contained-app"
+        subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     source_logo = Path(__file__).resolve().parent / "assets/sigma-logo.png"
     if (resources / "sigma.png").read_bytes() != source_logo.read_bytes():
         raise RuntimeError("Installed logo differs from the supplied artwork")
@@ -41,11 +61,14 @@ def main():
     env = os.environ.copy()
     env["SIGMA_DESKTOP_TEST_RESOURCES"] = str(resources)
     env.update(NUMBA_CACHE_DIR=str(output / "numba-cache"), MPLCONFIGDIR=str(output / "mpl-cache"), PYTHONWARNINGS="ignore")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     # A poisoned PYTHONPATH must not affect the -I entry point.
     poison = output / "poison-path"
     poison.mkdir(exist_ok=True)
     (poison / "napari_sigma.py").write_text("raise RuntimeError('External PYTHONPATH was loaded')\n", encoding="utf-8")
     env["PYTHONPATH"] = str(poison)
+    if app:
+        run_native_smoke(app, output / "native", env)
     commands = [
         [python, "-I", "-c", "import sys, pathlib, napari_sigma; p=pathlib.Path(napari_sigma.__file__).resolve(); assert p.is_relative_to(pathlib.Path(sys.prefix).resolve()), p; print(p)"],
         [python, "-I", "-m", "pip", "check"],
@@ -55,6 +78,7 @@ def main():
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "font_tests", "-v"],
     ]
     for index, command in enumerate(commands):
+        command.insert(2, "-B")
         command = [str(arg) for arg in command]
         print(subprocess.list2cmdline(command), flush=True)
         # The existing tests also create non-isolated child interpreters. Keep
@@ -68,7 +92,7 @@ def main():
         (output / f"check-{index}.log").write_bytes(result.stdout)
         print(result.stdout.decode("utf-8", errors="replace"), flush=True)
         result.check_returncode()
-    shortcuts = json.loads((resources / "shortcuts.json").read_text(encoding="utf-8"))
+    shortcuts = {"paths": [str(app)]} if app else json.loads((resources / "shortcuts.json").read_text(encoding="utf-8"))
     if not shortcuts["paths"]:
         raise RuntimeError("No desktop shortcut was installed")
     for path in shortcuts["paths"]:
@@ -84,6 +108,9 @@ def main():
         assert plist["CFBundleName"] == "SIGMA"
         installed_icon = apps[0] / "Contents/Resources" / plist["CFBundleIconFile"]
         assert installed_icon.read_bytes() == (resources / "sigma.icns").read_bytes()
+        if app:
+            # Loading and running the app must not create cache files inside it.
+            subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     elif sys.platform == "win32":
         links = [Path(path) for path in shortcuts["paths"] if path.endswith(".lnk")]
         if not links or any(path.name != "SIGMA.lnk" for path in links):

@@ -12,7 +12,7 @@ class BundledFontTests(unittest.TestCase):
         resources = Path(os.environ.get("SIGMA_DESKTOP_TEST_RESOURCES", Path(sys.prefix) / "sigma-desktop"))
         with tempfile.TemporaryDirectory(prefix="sigma-font-test-") as directory:
             result = subprocess.run(
-                [sys.executable, "-I", str(Path(__file__).with_name("font_probe.py")),
+                [sys.executable, "-I", "-B", str(Path(__file__).with_name("font_probe.py")),
                  str(resources), scenario, directory], capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             print(result.stdout, end="", flush=True)

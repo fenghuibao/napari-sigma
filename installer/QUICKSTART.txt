@@ -7,11 +7,17 @@ CHOOSE YOUR DOWNLOAD
   This is not a Windows ARM64 build. NVIDIA acceleration is not included.
 
 INSTALL AND OPEN
-1. Double-click the PKG (Mac) or EXE (Windows) installer.
-2. Follow the installer. Installing the private runtime may take several minutes.
+1. Mac: open the DMG and drag SIGMA.app to Applications, then eject the DMG.
+   Python and all analysis dependencies are inside SIGMA.app, not /Library.
+   You may also copy the complete app to your personal Applications folder.
+   Windows: double-click the EXE and follow the installer.
+2. Windows runtime installation may take several minutes. Mac needs only copying.
 3. Open "SIGMA" from Applications (Mac) or Start/Desktop (Windows).
 4. The SIGMA panel opens automatically. Use Open File or drag a TIFF into napari.
 5. Check channel, time, Z and physical pixel sizes before analysis.
+
+The panel displays: SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm).
+Application/window names remain SIGMA without a version suffix.
 
 You do not need Python, conda, pip, or a terminal. The installer works offline.
 The installed runtime occupies more space than the compressed download.
@@ -37,12 +43,18 @@ Startup failures show a dialog with details and the log location.
 
 UNINSTALL
 - Windows: Settings > Apps > Installed apps > SIGMA > Uninstall.
-- Mac: close SIGMA; remove its application shortcut and its private runtime
-  (~/Library/sigma-0.0.5 for a user install, /Library/sigma-0.0.5 for a system
-  install). Do not delete your image or result folders.
+- Mac DMG app: quit SIGMA, then move SIGMA.app from Applications to the Trash.
+  This removes the app and its entire Python/analysis runtime together.
+  Preferences, logs and caches remain in ~/Library/Application Support/SIGMA,
+  ~/Library/Logs/SIGMA and ~/Library/Caches/SIGMA; remove those separately only
+  if you want to erase settings/logs/caches too. Never delete image/result folders.
+- Older PKG builds stored their runtime in ~/Library/sigma-0.0.5 (user install)
+  or /Library/sigma-0.0.5 (system install). This new app neither uses nor deletes
+  those old directories. They require a separate, deliberate legacy cleanup.
 
 UPDATES
-Close SIGMA and uninstall an older desktop build before installing its replacement.
-Older test builds used the application name "SIGMA 0.0.5"; remove that shortcut too.
+Quit SIGMA before replacing it. Mac: drag the new app into Applications and choose
+Replace. Windows: uninstall the older desktop build, then install its replacement.
+Older PKG builds used an external runtime; see the legacy cleanup note above.
 The app/shortcut name is now always SIGMA; internal version metadata is retained.
 Do not update individual Python packages inside this tested desktop runtime.

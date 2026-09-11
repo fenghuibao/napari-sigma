@@ -45,12 +45,9 @@ jobs:
         run: python -m unittest discover -s installer/tests -v
       - name: Build offline installer
         run: python installer/build.py --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
-      - name: Install macOS package in disposable runner
+      - name: Verify read-only DMG, relocated macOS app and deletion uninstall
         if: runner.os == 'macOS'
-        run: sudo installer -pkg dist-desktop/*.pkg -target / -dumplog
-      - name: Verify installed macOS application and core regressions
-        if: runner.os == 'macOS'
-        run: python installer/verify.py --prefix /Library/sigma-0.0.5 --output-dir dist-desktop/verification
+        run: python installer/ci_macos_app.py --dmg dist-desktop/*.dmg --build-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop/verification
       - name: Install Windows package (path with spaces)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -81,14 +78,6 @@ jobs:
           foreach ($shortcut in $record.shortcuts.paths) {
             if (Test-Path $shortcut) { throw "Shortcut remains after uninstall: $shortcut" }
           }
-      - name: Collect macOS installation diagnostics
-        if: always() && runner.os == 'macOS'
-        run: |
-          mkdir -p dist-desktop/diagnostics
-          sudo tail -n 500 /var/log/install.log > dist-desktop/diagnostics/installer.log
-          if [ -f /Library/sigma-0.0.5/sigma-desktop/installation.log ]; then
-            sudo cp /Library/sigma-0.0.5/sigma-desktop/installation.log dist-desktop/diagnostics/pip-installation.log
-          fi
       - name: Collect Windows installation diagnostics
         if: always() && runner.os == 'Windows'
         shell: pwsh

@@ -215,7 +215,7 @@ def main():
     target = native_platform()
     if not args.conda or not args.constructor:
         parser.error("conda and constructor are required in the build environment")
-    if not args.prepare_only:
+    if not args.prepare_only and target == "win-64":
         # Constructor can otherwise fall back after a failed executable probe
         # and still emit an installer with incorrectly detected capabilities.
         run([args.standalone_conda, "--version"])
@@ -266,11 +266,15 @@ def main():
     shutil.copy2(payload / "bundle.json", output / f"bundle-{target}.json")
     shutil.copy2(HERE / "QUICKSTART.txt", output / "QUICKSTART.txt")
     if not args.prepare_only:
-        env = os.environ.copy()
-        if args.reuse_wheelhouse:
-            env["CONDA_OFFLINE"] = "true"
-        run([args.constructor, "--conda-exe", args.standalone_conda,
-             "--output-dir", output, "--cache-dir", work / "constructor-cache", work], env=env)
+        if target.startswith("osx-"):
+            from mac_app import build_app
+            build_app(target, VERSION, work, payload, output)
+        else:
+            env = os.environ.copy()
+            if args.reuse_wheelhouse:
+                env["CONDA_OFFLINE"] = "true"
+            run([args.constructor, "--conda-exe", args.standalone_conda,
+                 "--output-dir", output, "--cache-dir", work / "constructor-cache", work], env=env)
     print(f"Bundle prepared for {target}: {output}", flush=True)
 
 
