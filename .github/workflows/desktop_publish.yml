@@ -1,0 +1,38 @@
+name: Publish verified desktop installer
+
+on:
+  push:
+    branches: [build/desktop-installers]
+    paths: [".github/workflows/desktop_publish.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish-windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Require the fully passed native build
+        run: |
+          test "$(gh run view 34690049483 --repo "$REPO" --json conclusion --jq .conclusion)" = success
+          gh release view v0.0.6 --repo "$REPO" --json tagName --jq .tagName
+      - name: Retrieve the exact tested artifact
+        run: gh run download 34690049483 --repo "$REPO" --name SIGMA-0.0.6-win-64-unsigned --dir verified
+      - name: Check complete EXE digest and single-asset size
+        shell: python
+        run: |
+          import hashlib, pathlib
+          exe = pathlib.Path('verified/SIGMA-0.0.6-windows-x86_64-cu130.exe')
+          assert exe.stat().st_size == 1839222494 < 2 ** 31
+          with exe.open('rb') as source:
+              assert hashlib.file_digest(source, 'sha256').hexdigest() == 'db162319632bf8979315268fe1236608c7dc39c5d267393245295e4f19972a3c'
+          print('Exact tested CUDA/CPU EXE verified. No sidecars, logs or caches will be uploaded.')
+      - name: Add only the complete EXE to the existing release
+        run: gh release upload v0.0.6 verified/SIGMA-0.0.6-windows-x86_64-cu130.exe --repo "$REPO"
