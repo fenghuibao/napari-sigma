@@ -26,6 +26,21 @@ class NativeTiffCalibration(unittest.TestCase):
     def setUp(self):
         with temporary_directory(self) as directory:
             self.path = str(Path(directory) / "imagej.tif")
+        # ndarray views may outlive their original np.memmap wrapper. Own the
+        # actual OS mapping handles and close them after the entire test GUI,
+        # before removing fixture files (Windows does not permit unlink yet).
+        self._fixture_mappings = {}
+        self.addCleanup(self._close_fixture_mappings)
+        read_array = tifffile.TiffPageSeries.asarray
+        def tracked_array(series, *args, **kwargs):
+            data = read_array(series, *args, **kwargs)
+            mapping = getattr(data, "_mmap", None)
+            if mapping is not None:
+                self._fixture_mappings[id(mapping)] = mapping
+            return data
+        reader = patch.object(tifffile.TiffPageSeries, "asarray", new=tracked_array)
+        reader.start()
+        self.addCleanup(reader.stop)
         self.shape = (2, 3, 8, 9)
         tifffile.imwrite(self.path, np.arange(np.prod(self.shape), dtype=np.uint16).reshape(self.shape),
                          imagej=True, metadata={"axes": "TZYX", "unit": "micron", "spacing": .2,
@@ -38,6 +53,11 @@ class NativeTiffCalibration(unittest.TestCase):
         self.viewer.close()
         self.viewer = None
         self.App.processEvents()
+
+    def _close_fixture_mappings(self):
+        for mapping in self._fixture_mappings.values():
+            mapping.close()
+        self._fixture_mappings.clear()
 
     def panel(self):
         from qtpy.QtCore import QEvent

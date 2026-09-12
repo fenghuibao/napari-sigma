@@ -168,6 +168,16 @@ jobs:
           if ($env:SIGMA_TEST_PREFIX -and (Test-Path $log)) {
             Copy-Item $log dist-desktop/diagnostics/pip-installation.log
           }
+      - name: Upload lightweight Windows verification records
+        uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: SIGMA-0.0.6-win-64-checks
+          path: |
+            dist-desktop/verification/
+            dist-desktop/source-provenance.json
+            dist-desktop/bundle-win-64.json
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
