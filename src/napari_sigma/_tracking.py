@@ -346,12 +346,26 @@ def _allocate_frame_sample_counts(
         )
 
     capacities = np.asarray([item[1] for item in eligible], dtype=int)
-    target = min(int(target), int(np.sum(capacities)))
+    requested = int(target)
+    total_capacity = int(np.sum(capacities))
+    target = min(requested, total_capacity)
     if target < len(eligible):
-        raise ValueError(
-            f"sample_points={target} is smaller than the {len(eligible)} objects "
-            "in a frame; increase the budget so every object can be sampled."
+        # Report the value the user actually set. This used to print the
+        # already-clamped target, so when the clamp was the binding limit the
+        # message named a number the user had never entered and the advice to
+        # raise the budget was wrong — the objects were simply too small to
+        # supply one sample point each.
+        detail = (
+            f"sample_points={requested} is smaller than the {len(eligible)} objects "
+            "in this frame; raise the budget so every object can be sampled."
+            if requested <= total_capacity
+            else
+            f"the {len(eligible)} objects in this frame can supply only "
+            f"{total_capacity} sample point(s) in total, fewer than one each, so "
+            f"sample_points={requested} cannot be met. Raising the budget will not "
+            "help; segment larger objects or lower min_link_size."
         )
+        raise ValueError(detail)
 
     counts = np.ones(len(eligible), dtype=int)
     remaining = int(target - len(eligible))
@@ -2027,9 +2041,14 @@ def _manual_link_candidate(
     spatial_ndim = len(source.centroid)
     if len(target.centroid) != spatial_ndim:
         raise ValueError("Manual link detections must have matching dimensions.")
-    spacing_scale = np.asarray(
+    # Same scaling as the automatic path (`_spacing_array` divides by the last
+    # axis, giving x-pixel units). Using the raw physical spacing here made a
+    # manual link's distance smaller than an automatic one by the reciprocal of
+    # the x pixel size — a factor of ~15 for a 0.065 um pixel — while both were
+    # compared against the same `cost_cutoff` and summed into one objective.
+    spacing_scale = _spacing_array(
         _normalize_spacing(spacing, spatial_ndim),
-        dtype=float,
+        spatial_ndim,
     )
     source_centroid = np.asarray(source.centroid, dtype=float) * spacing_scale
     target_centroid = np.asarray(target.centroid, dtype=float) * spacing_scale

@@ -8,6 +8,16 @@ import numpy as np
 from ._image_io import SUPPORTED_IMAGE_SUFFIXES, load_image_tc_zyx
 
 
+def _units_for_ndim(unit, ndim: int):
+    """Per-axis units, or None when unit-less or on napari < 0.9."""
+    if not unit:
+        return None
+    from napari.layers import Image as NapariImage
+    if not hasattr(NapariImage, "units"):
+        return None
+    return (unit,) * max(int(ndim), 1)
+
+
 def tczyx_to_layer_data(data, meta: dict, name: str):
     array = np.asarray(data)
     if array.ndim != 5:
@@ -33,6 +43,13 @@ def tczyx_to_layer_data(data, meta: dict, name: str):
         metadata["channel_name"] = channel_name
         kwargs = {"name": name if channels == 1 else f"{name} [{channel_name}]",
                   "metadata": metadata, "scale": scale}
+        # Give the unit at construction, not afterwards. napari checks unit
+        # consistency on the next draw, so a layer that starts on the default
+        # unit and is corrected later makes napari report inconsistent units
+        # and stop rendering them for that frame.
+        units = _units_for_ndim(meta.get("unit"), len(dims))
+        if units is not None:
+            kwargs["units"] = units
         if kind == "image":
             kwargs.update(rgb=False, blending="additive")
         elif volume.dtype.kind not in "uib":

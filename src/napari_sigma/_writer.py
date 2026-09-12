@@ -8,28 +8,12 @@ import numpy as np
 import tifffile
 from PIL import Image
 
-from ._metadata import unit_from_metadata
+from ._metadata import SIGMA_TIFF_METADATA_KEYS, axes_for_ndim, unit_from_metadata
 
 _SUPPORTED_WRITE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".gif", ".mp4"}
-_SIGMA_TIFF_METADATA_KEYS = (
-    "sigma_layer_role",
-    "sigma_saved_structure",
-    "is_frangi",
-    "frangi_result_name",
-    "frangi_response_mode",
-    "frangi_rescale_enabled",
-    "frangi_rescale_low_percent",
-    "frangi_vessel_rescale_low_percent",
-    "frangi_sheet_rescale_low_percent",
-    "frangi_sigmas",
-    "frangi_vessel_sigmas",
-    "frangi_sheet_sigmas",
-    "frangi_combined_method",
-    "frangi_combined_component",
-    "is_proximity_roi_mask",
-    "proximity_source_layer",
-    "proximity_roi_count",
-)
+# Single source of truth lives in _metadata so the reader restores
+# exactly what this writer persists.
+_SIGMA_TIFF_METADATA_KEYS = SIGMA_TIFF_METADATA_KEYS
 
 
 def _unit_from_meta(meta: dict) -> str:
@@ -60,13 +44,7 @@ def _scale_from_meta(meta: dict, ndim: int) -> tuple[float, ...]:
     return (1.0,) * (ndim - len(scale)) + scale
 
 
-def _axes_for_ndim(ndim: int) -> str:
-    return {
-        2: "YX",
-        3: "ZYX",
-        4: "TZYX",
-        5: "TCZYX",
-    }.get(ndim, "".join("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[-ndim:]))
+_axes_for_ndim = axes_for_ndim
 
 
 def _axes_from_meta(meta: dict, ndim: int) -> str:

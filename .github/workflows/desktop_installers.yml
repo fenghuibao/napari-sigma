@@ -1,30 +1,68 @@
 name: Desktop installers (unsigned)
 
+# One platform can be verified before the others are produced. This workflow
+# file does not exist on the default branch, so GitHub does not offer its
+# "Run workflow" button; pushing is the trigger that actually works here, and
+# a [build: ...] tag in the commit message chooses the platforms.
 on:
   push:
     branches: [build/desktop-installers]
     paths: ["installer/**", ".github/workflows/desktop_installers.yml", "tests/**"]
   workflow_dispatch:
+    inputs:
+      targets:
+        description: Platforms to build
+        type: choice
+        default: osx-arm64
+        options: [osx-arm64, osx-64, win-64, macos, all]
 
 permissions:
   contents: read
 
 concurrency:
-  group: desktop-${{ github.ref }}
+  group: desktop-${{ github.ref }}-${{ inputs.targets }}
   cancel-in-progress: true
 
 jobs:
+  select-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - id: select
+        shell: python
+        run: |
+          import json, os, re
+          platforms = {
+              "osx-arm64": {"os": "macos-15", "target": "osx-arm64"},
+              "osx-64": {"os": "macos-15-intel", "target": "osx-64"},
+              "win-64": {"os": "windows-2022", "target": "win-64"},
+          }
+          groups = {"all": list(platforms), "macos": ["osx-arm64", "osx-64"]}
+          # A dispatch states its targets outright. A push carries them in a
+          # "[build: osx-arm64]" tag, and builds every platform without one.
+          requested = ${{ toJSON(inputs.targets || '') }}
+          message = ${{ toJSON(github.event.head_commit.message || '') }}
+          if not requested:
+              tag = re.search(r"\[build:([^\]]+)\]", message)
+              requested = tag.group(1) if tag else "all"
+          names = []
+          for name in requested.replace(",", " ").split():
+              names.extend(groups.get(name, [name]))
+          unknown = [name for name in names if name not in platforms]
+          if unknown:
+              raise SystemExit(f"Unknown build target(s) {unknown}; choose from {list(platforms)} or {list(groups)}")
+          chosen = [platforms[name] for name in dict.fromkeys(names)]
+          print(f"Building: {[entry['target'] for entry in chosen]}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"matrix={json.dumps(chosen)}\n")
+
   build-and-install:
+    needs: select-targets
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-15
-            target: osx-arm64
-          - os: macos-15-intel
-            target: osx-64
-          - os: windows-2022
-            target: win-64
+        include: ${{ fromJSON(needs.select-targets.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -40,11 +78,11 @@ jobs:
           channels: conda-forge
           conda-remove-defaults: true
       - name: Install isolated build tools
-        run: conda install --override-channels -c conda-forge constructor=3.16.1 conda-standalone menuinst=2.5.2 pillow pyyaml --yes --quiet
+        run: conda install --override-channels -c conda-forge constructor=3.16.1 conda-standalone menuinst=2.5.2 pillow pyyaml pip setuptools --yes --quiet
       - name: Packaging unit tests
         run: python -m unittest discover -s installer/tests -v
       - name: Build offline installer
-        run: python installer/build.py --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
+        run: python installer/build.py --source-dir "$GITHUB_WORKSPACE" --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
       - name: Collect failed macOS disk-image diagnostics
         if: failure() && runner.os == 'macOS'
         run: |
@@ -54,13 +92,13 @@ jobs:
           ps -axo pid,ppid,etime,%cpu,comm > dist-desktop/diagnostics/processes.txt
       - name: Verify read-only DMG, relocated macOS app and deletion uninstall
         if: runner.os == 'macOS'
-        run: python installer/ci_macos_app.py --dmg dist-desktop/*.dmg --build-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop/verification
+        run: python installer/ci_macos_app.py --dmg dist-desktop/*.dmg --build-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop/verification --source-dir "$GITHUB_WORKSPACE"
       - name: Install Windows package (path with spaces)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $package = (Get-ChildItem dist-desktop/*.exe).FullName
-          $prefix = "$env:LOCALAPPDATA\SIGMA Desktop Test\0.0.5"
+          $prefix = "$env:LOCALAPPDATA\SIGMA Desktop Test\0.0.6"
           $proc = Start-Process -FilePath $package -ArgumentList "/S /InstallationType=JustMe /AddToPath=0 /RegisterPython=0 /D=$prefix" -Wait -PassThru
           if ($proc.ExitCode -ne 0) { throw "Installer failed with exit code $($proc.ExitCode)" }
           "SIGMA_TEST_PREFIX=$prefix" >> $env:GITHUB_ENV
@@ -72,7 +110,7 @@ jobs:
         if: runner.os == 'Windows'
         # No driver or rendering shim is added to the distributable application.
         # The preceding step prepares only the disposable runner's display.
-        run: python installer/verify.py --prefix "$SIGMA_TEST_PREFIX" --output-dir dist-desktop/verification
+        run: python installer/verify.py --prefix "$SIGMA_TEST_PREFIX" --output-dir dist-desktop/verification --source-dir "$GITHUB_WORKSPACE"
       - name: Test Windows uninstaller
         if: runner.os == 'Windows'
         shell: pwsh
@@ -97,7 +135,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: SIGMA-0.0.5-${{ matrix.target }}-unsigned
+          name: SIGMA-0.0.6-${{ matrix.target }}-unsigned
           path: dist-desktop/
           compression-level: 0
           retention-days: 30

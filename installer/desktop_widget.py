@@ -11,10 +11,12 @@ from pathlib import Path
 import threading
 from time import perf_counter
 
-from qtpy.QtCore import Qt, QThread, QTimer
-from qtpy.QtWidgets import QLabel, QSizePolicy
+from qtpy.QtCore import QThread, QTimer
 from napari_sigma._widget import SIGMAWidget
 
+# Shown in the napari window title and on the dock panel's own title bar. The
+# application, shortcut and splash names stay "SIGMA": macOS puts those in the
+# menu bar and Dock, where the expanded name does not fit.
 FULL_NAME = "SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)"
 
 
@@ -71,13 +73,9 @@ class DesktopSIGMAWidget(SIGMAWidget):
         self._desktop_plot_error = None
         self._desktop_plot_timer = None
         super().__init__(viewer)
-        self._desktop_full_name = QLabel(FULL_NAME, self)
-        self._desktop_full_name.setObjectName("sigmaFullName")
-        self._desktop_full_name.setWordWrap(True)
-        self._desktop_full_name.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._desktop_full_name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self._desktop_full_name.setContentsMargins(4, 4, 4, 8)
-        self.layout().insertWidget(0, self._desktop_full_name)
+        # The full name is carried by the dock and window title bars rather
+        # than a label inside the panel, which keeps the tabs at the top.
+        self.setWindowTitle(FULL_NAME)
         self._desktop_plot_preparation = plot_preparation or shared_preparation()
         self._analysis_plot_placeholder.setText(
             "Preparing charts with bundled fonts in the background… You can keep using SIGMA.")

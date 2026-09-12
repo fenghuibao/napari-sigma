@@ -16,6 +16,9 @@ def run_smoke(python: Path, resources: Path, output: Path, env: dict):
     # The child keeps TIFF memory maps alive until GUI shutdown. In particular,
     # Windows cannot unlink them earlier. Cleanup errors must not be suppressed.
     with tempfile.TemporaryDirectory(prefix="sigma-smoke-") as directory:
+        home = Path(directory) / "home"
+        home.mkdir()
+        env = dict(env, HOME=str(home))
         command = [str(python), "-I", "-B", str(Path(__file__).resolve().parent / "font_tests/font_probe.py"),
                    "--launch", str(resources / "launch.py"), "--smoke-test",
                    "--smoke-data-dir", directory, "--screenshot", str(output / "desktop.png")]
@@ -26,6 +29,9 @@ def run_smoke(python: Path, resources: Path, output: Path, env: dict):
 def run_native_smoke(app: Path, output: Path, env: dict):
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sigma-native-smoke-") as directory:
+        home = Path(directory) / "home"
+        home.mkdir()
+        env = dict(env, HOME=str(home))
         command = [str(app / "Contents/MacOS/SIGMA"), "--smoke-test",
                    "--smoke-data-dir", directory, "--screenshot", str(output / "desktop.png")]
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -43,6 +49,8 @@ def main():
     location.add_argument("--prefix", type=Path)
     location.add_argument("--app", type=Path, help="Self-contained macOS application")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--source-dir", type=Path, required=True,
+                        help="Canonical SIGMA checkout providing the regression tests")
     args = parser.parse_args()
     app = args.app.resolve() if args.app else None
     prefix = app / "Contents/Resources/runtime" if app else args.prefix.resolve()
@@ -59,6 +67,9 @@ def main():
     assert bundle["branding"]["logo_sha256"] == hashlib.sha256(source_logo.read_bytes()).hexdigest()
     python = prefix / ("python.exe" if sys.platform == "win32" else "bin/python")
     env = os.environ.copy()
+    test_home = output / "test-home"
+    test_home.mkdir(exist_ok=True)
+    env["HOME"] = str(test_home)
     env["SIGMA_DESKTOP_TEST_RESOURCES"] = str(resources)
     env.update(NUMBA_CACHE_DIR=str(output / "numba-cache"), MPLCONFIGDIR=str(output / "mpl-cache"), PYTHONWARNINGS="ignore")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -73,7 +84,7 @@ def main():
         [python, "-I", "-c", "import sys, pathlib, napari_sigma; p=pathlib.Path(napari_sigma.__file__).resolve(); assert p.is_relative_to(pathlib.Path(sys.prefix).resolve()), p; print(p)"],
         [python, "-I", "-m", "pip", "check"],
         [python, "-I", resources / "launch.py", "--smoke-test", "--screenshot", output / "desktop.png"],
-        [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parents[1] / "tests", "-v"],
+        [python, "-I", "-m", "unittest", "discover", "-s", args.source_dir.resolve() / "tests", "-v"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "gui_tests", "-v"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "font_tests", "-v"],
     ]

@@ -279,10 +279,14 @@ from napari_sigma._widget import SIGMAWidget
 from qtpy.QtWidgets import QApplication
 v=napari.Viewer(show=False)
 w=SIGMAWidget(v)
+# Construction stays lazy; the deferred device-availability check below is
+# now intentionally allowed to import Torch once the panel is initialized.
+assert 'torch' not in sys.modules, 'Torch imported during widget construction'
 QApplication.processEvents()
 assert 'matplotlib' not in sys.modules, 'Matplotlib eagerly imported'
 assert 'openpyxl' not in sys.modules, 'openpyxl eagerly imported'
-assert 'torch' not in sys.modules, 'Torch eagerly imported'
+assert w.device_combo.findText('cpu') >= 0
+assert w.device_combo.findText('auto') < 0
 assert 'cv2' not in sys.modules, 'OpenCV eagerly imported'
 assert w._analysis_plot_axes is None
 w._panel_tabs.setCurrentWidget(w._analysis_tab)

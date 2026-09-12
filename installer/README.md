@@ -1,4 +1,18 @@
-# SIGMA desktop installers
+# SIGMA desktop packaging
+
+For the current 0.0.6 Apple Silicon app, use the [local-source build](#current-local-source-apple-silicon-build)
+instructions below. They preserve the canonical checkout's current UI wording.
+The older cross-platform instructions in the next section are historical.
+
+The current Apple Silicon title-alignment update is in
+`../../SIGMA-Desktop-0.0.6/centered-title/`. `mac_window.py` and the small
+`mac_titlebar.m` bridge center a passive label in the existing native title bar,
+without adding a toolbar or changing the core/plugin or interface wording.
+Native close/minimize/fullscreen controls are retained. The geometry regression
+measures the actual AppKit title at several window widths, and the native
+launcher smoke test checks the packaged app's title center as well.
+
+## Historical cross-platform packaging reference
 
 Native, offline installers for the **unchanged published napari-sigma 0.0.5 wheel**.
 The desktop launcher opens napari and the SIGMA panel automatically. No terminal,
@@ -6,9 +20,12 @@ Python installation, shell initialization, or administrator rights are needed fo
 a per-user installation. On macOS, drag the app from its DMG into Applications
 (or your personal Applications folder); delete the app to uninstall its runtime.
 
-Application and shortcut names are always **SIGMA**, without a version suffix.
-The panel shows **SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)**,
-using the author's exact spelling, with wrapping for narrow displays.
+Application, Dock and shortcut names are always **SIGMA**, without a version
+suffix: macOS puts those in the menu bar and Dock, where a long name does not
+fit. The napari window title bar and the SIGMA panel's own title bar both read
+**SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)**, using the
+author's exact spelling. When a narrow display tabifies the panel beside the
+layer controls, that same full name becomes its tab label.
 Internal bundle metadata and installer filenames retain
 the core version for compatibility checks and diagnosis. The user-supplied
 `assets/sigma-logo-original.png` is retained. `prepare_logo.py` deterministically
@@ -17,6 +34,16 @@ its interior artwork; the result `assets/sigma-logo.png` has real RGBA transpare
 That prepared PNG is copied unchanged to the runtime and only resized when
 encoding ICO/ICNS. The same artwork appears on the transparent startup screen
 and Qt windows. App-icon encoding is tested for pixel and alpha preservation.
+
+`mac_icon.py` also gives the disk image that artwork. The image is built
+read/write so its volume root can be flagged `kHasCustomIcon` next to the
+staged `.VolumeIcon.icns`, then compressed to UDZO exactly as before, so the
+mounted volume shows the emblem. The finished `.dmg` file additionally gets an
+`icns` resource written straight into its resource fork, without the deprecated
+Rez/DeRez/SetFile tools. That fork is filesystem metadata: it survives a local
+copy or `ditto`, but a zip, a CI artifact or a browser download strips it, so a
+downloaded `.dmg` will still show Finder's generic disk-image icon. The volume
+icon travels inside the image and is always preserved.
 
 The desktop app uses Matplotlib 3.11.1's official `MPL_IGNORE_SYSTEM_FONTS=1`
 setting and a pre-generated index containing only the fonts shipped in that wheel.
@@ -152,3 +179,36 @@ deleted or reused by this new layout; the guide describes their separate cleanup
 Uninstall the previous Windows build before replacement. The stable SIGMA app name
 is shared across versions, so side-by-side shortcuts are not supported.
 Core Python-package publishing is independent of this build.
+
+## Current local-source Apple Silicon build
+
+This maintained packaging directory was restored from the untouched
+`../sync-0.0.6-20260911/installer` snapshot. The canonical core remains at
+`../../napari-sigma`; do not maintain another core checkout here or in `/tmp`.
+Claude's desktop wording, layout and transparent logo are preserved.
+
+Use `build_current_macos.py` for local builds, not the older PyPI-based
+`build.py` command above. It builds a fresh wheel from the canonical checkout,
+compares every packaged Python/YAML file byte-for-byte with that checkout,
+verifies cached dependencies before reuse, and records source hashes and the
+Git commit in `source-provenance.json`. Existing installed apps are untouched.
+
+```sh
+/private/tmp/sigma-desktop-build/tools/bin/python -B build_current_macos.py \
+  --source-dir /Users/huibao/Documents/Segmentation/napari-sigma \
+  --build-python /Users/huibao/miniconda3/envs/sigma-qt6/bin/python \
+  --dependency-cache /private/tmp/sigma-desktop-build/mac-arm64-v2 \
+  --work-dir /private/tmp/sigma-desktop-build/mac-arm64-006-current \
+  --output-dir /Users/huibao/Documents/Segmentation/SIGMA-Desktop-0.0.6
+```
+
+Use a fresh work directory for each build. `hdiutil` requires normal macOS
+disk-image permissions and cannot run inside a restrictive process sandbox.
+The output directory is persistent; temporary work directories contain only
+build artifacts. Keep the hash-locked dependency cache for offline rebuilds.
+
+Verify the resulting DMG using `ci_macos_app.py --dmg PATH --build-dir WORK
+--output-dir CHECKS --source-dir CANONICAL_SOURCE`. This launches the native app
+from a read-only image, relocates a test-owned copy, tests the installed core,
+and removes only that temporary copy. Existing SIGMA installations and user
+preferences are preserved. Verification uses disposable home directories.

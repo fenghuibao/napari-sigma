@@ -49,7 +49,9 @@ def smoke_checks(viewer, panel, directory: Path) -> dict:
     # verify.py owns this directory and removes it only after this GUI process
     # exits. napari keeps a memory map alive while displaying the TIFF, which
     # correctly prevents deletion of the backing file on Windows.
-    path = str(directory / "校准 labels.tif")
+    # Keeps the space and non-ASCII coverage without writing a build-machine
+    # filename in another language into the shipped verification logs.
+    path = str(directory / "calibración labels.tif")
     labels = np.zeros((2, 3, 8, 9), np.uint64)
     labels[:, :, 1:7, 2:8] = 2**40 + 1
     write_single_labels(path, labels, {"scale": (1, 2, .3, .2), "metadata": {"dims": "TZYX"}})
@@ -88,8 +90,16 @@ def main(argv=None) -> int:
         if not args.smoke_test:
             log_stream = log_path.open("a", encoding="utf-8", buffering=1)
             sys.stdout = sys.stderr = log_stream
-        from napari_sigma._launcher import _configure_pyqt6
+        from napari_sigma._launcher import _configure_pyqt6, prefer_sigma_reader
         _configure_pyqt6()
+        # A dropped file must arrive calibrated: napari draws inside
+        # LayerList.insert, ahead of every plugin callback, so a layer that
+        # starts on the default "pixel" unit makes napari report inconsistent
+        # units before SIGMA can repair it. See prefer_sigma_reader.
+        # force=True: this is SIGMA's own application and its own settings
+        # directory (NAPARI_CONFIG above), not a shared napari where another
+        # plugin's reader assignment deserves to be left alone.
+        prefer_sigma_reader(force=True)
         from qtpy.QtCore import Qt
         from qtpy.QtGui import QIcon, QPixmap, QPainter, QColor
         from qtpy.QtWidgets import QApplication, QSplashScreen
@@ -133,7 +143,9 @@ def main(argv=None) -> int:
         bundle = json.loads((RESOURCES / "bundle.json").read_text(encoding="utf-8"))
         if napari_sigma.__version__ != bundle["sigma_version"]:
             raise RuntimeError("SIGMA installation version mismatch. Reinstall the complete desktop package.")
-        viewer = napari.Viewer(title="SIGMA", show=False)
+        # The window and dock title bars carry the expanded name; the
+        # application, Dock tile and splash stay "SIGMA".
+        viewer = napari.Viewer(title=desktop.FULL_NAME, show=False)
         # napari sets its own application icon during window creation/theme
         # changes. Restore SIGMA branding, including an explicit window icon.
         def restore_icon(*_):
@@ -142,12 +154,20 @@ def main(argv=None) -> int:
         viewer.events.theme.connect(restore_icon)
         restore_icon()
         panel = desktop.DesktopSIGMAWidget(viewer)
-        dock = viewer.window.add_dock_widget(panel, name="SIGMA")
+        dock = viewer.window.add_dock_widget(panel, name=desktop.FULL_NAME)
+        # A no-op when this build's accelerator is not actually present: the
+        # combo lists only usable devices (best first) and drops the rest.
         panel.device_combo.setCurrentText(bundle["default_device"])
         viewer.show()
         # The scientific panel has a substantial minimum width. A small default
         # napari window can otherwise leave no visible image canvas.
         viewer.window._qt_window.showMaximized()
+        mac_window = None
+        if sys.platform == "darwin":
+            native_spec = importlib.util.spec_from_file_location("sigma_mac_window", RESOURCES / "mac_window.py")
+            mac_window = importlib.util.module_from_spec(native_spec)
+            native_spec.loader.exec_module(mac_window)
+            mac_window.center_window_title(viewer.window._qt_window)
         # A 1024-wide display cannot fit both sidebars plus the image. Keep
         # layer controls/list accessible as tabs beside SIGMA on small screens.
         if viewer.window._qt_window.screen().availableGeometry().width() < 1280:
@@ -159,10 +179,22 @@ def main(argv=None) -> int:
         splash.finish(viewer.window._qt_window)
         app.processEvents()
         if args.smoke_test:
-            if panel._desktop_full_name.text() != desktop.FULL_NAME or not panel._desktop_full_name.isVisible():
-                raise RuntimeError("The full SIGMA name must be visible in the panel")
-            if app.applicationDisplayName() != "SIGMA" or viewer.window._qt_window.windowTitle() != "SIGMA":
-                raise RuntimeError("Application/window name must be SIGMA without a version suffix")
+            if mac_window is not None:
+                import math
+                offset = mac_window.title_center_offset(viewer.window._qt_window)
+                if not math.isfinite(offset) or abs(offset) > 2:
+                    raise RuntimeError(f"Native title is not centered: offset={offset} points")
+                print(json.dumps({"native_title_center_offset_points": offset}), flush=True)
+            window_title = viewer.window._qt_window.windowTitle()
+            if dock.windowTitle() != desktop.FULL_NAME:
+                raise RuntimeError(f"The panel title bar must show the full SIGMA name: {dock.windowTitle()!r}")
+            # napari owns the window title; require the name, not sole ownership.
+            if desktop.FULL_NAME not in window_title:
+                raise RuntimeError(f"The window title bar must show the full SIGMA name: {window_title!r}")
+            if app.applicationDisplayName() != "SIGMA":
+                raise RuntimeError("The application name must stay SIGMA")
+            if bundle["sigma_version"] in window_title or bundle["sigma_version"] in dock.windowTitle():
+                raise RuntimeError("Titles must not carry a version suffix")
             if viewer.window._qt_window.windowIcon().cacheKey() != icon.cacheKey():
                 raise RuntimeError("SIGMA window icon was replaced")
             print(json.dumps(smoke_checks(viewer, panel, args.smoke_data_dir)), flush=True)

@@ -33,7 +33,9 @@ _DEFAULT_TOL = 1e-8
 _GMM_INIT_MAX_POINTS = 100_000
 _EM_CONVERGENCE_MONITOR_POINTS = 65_536
 _DEFAULT_EM_CLASS_SAMPLE_POINTS = 1_000_000
-_MPS_OTSU_MONITOR_POINTS = 524_288
+# Histogram sample size for the Otsu threshold. Applied on every device so
+# the threshold does not depend on the machine (see _threshold_otsu_torch).
+_OTSU_HISTOGRAM_POINTS = 524_288
 
 # Floor added to `f0` inside `log(...)` for the Frangi anchor potential.
 # `1e-15` makes the anchor saturate at ±exp(34.5) ≈ 1e15 at the extremes,
@@ -76,13 +78,18 @@ def _threshold_otsu_torch(data: torch.Tensor, bins: int = 256) -> torch.Tensor:
     """
     bins = max(int(bins), 2)
     histogram_data = data.float().reshape(-1)
-    if data.device.type == "mps" and histogram_data.numel() > _MPS_OTSU_MONITOR_POINTS:
+    # Subsample on every device, not only MPS. The stride is deterministic, so
+    # this keeps the initial threshold — and therefore the initial label, and
+    # therefore the whole EM trajectory — identical across machines. It used to
+    # apply on MPS alone, which is why `init_method="otsu"` gave a different
+    # mask there than on CPU or CUDA for the same input.
+    if histogram_data.numel() > _OTSU_HISTOGRAM_POINTS:
         stride = max(
-            (histogram_data.numel() + _MPS_OTSU_MONITOR_POINTS - 1)
-            // _MPS_OTSU_MONITOR_POINTS,
+            (histogram_data.numel() + _OTSU_HISTOGRAM_POINTS - 1)
+            // _OTSU_HISTOGRAM_POINTS,
             1,
         )
-        histogram_data = histogram_data[::stride][:_MPS_OTSU_MONITOR_POINTS]
+        histogram_data = histogram_data[::stride][:_OTSU_HISTOGRAM_POINTS]
     counts = torch.histc(histogram_data, bins=bins, min=0.0, max=255.0)
     centers = (
         torch.arange(bins, dtype=counts.dtype, device=counts.device) + 0.5
@@ -164,35 +171,6 @@ def _loglh_gmm(X: torch.Tensor, pi: torch.Tensor, mu: torch.Tensor, sigma: torch
     """Log-likelihood of a 1D GMM."""
     return torch.log((pi * _gaussian(X.reshape(-1, 1), mu, sigma)).sum(dim=1) + _TINY).sum()
 
-
-def _calculate_resp_masked(
-    X_col: torch.Tensor,
-    mask: torch.Tensor,
-    pi: torch.Tensor,
-    mu: torch.Tensor,
-    sigma: torch.Tensor,
-) -> torch.Tensor:
-    """Responsibilities on fixed-size data with a binary sample mask."""
-    resp = pi * _gaussian(X_col, mu, sigma)
-    resp = resp / (resp.sum(dim=1, keepdim=True) + _TINY)
-    return resp * mask
-
-
-def _loglh_gmm_masked(
-    X_col: torch.Tensor,
-    mask_flat: torch.Tensor,
-    pi: torch.Tensor,
-    mu: torch.Tensor,
-    sigma: torch.Tensor,
-) -> torch.Tensor:
-    """Masked log-likelihood on fixed-size data."""
-    loglh = torch.log((pi * _gaussian(X_col, mu, sigma)).sum(dim=1) + _TINY)
-    return (loglh * mask_flat).sum()
-
-
-# ---------------------
-# Pairwise & potentials
-# ---------------------
 
 def _accumulate_axis_pairwise(
     accumulator: torch.Tensor,
@@ -439,54 +417,26 @@ def _em_once(
     pi: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor,
     tol_: float = 1e-6, max_iter_: int = 30
 ):
-    """Run a few EM steps to refresh GMM params for both classes."""
-    if data_flat.device.type in {"mps", "cuda"}:
-        return _em_once_sliced(
-            data_flat[mask_fore_flat],
-            data_flat[mask_back_flat],
-            n_fore,
-            n_back,
-            pi,
-            mu,
-            sigma,
-            tol_=tol_,
-            max_iter_=max_iter_,
-        )
+    """Run a few EM steps to refresh GMM params for both classes.
 
-    X_col = data_flat.reshape(-1, 1)
-    mask_bg = mask_back_flat.reshape(-1, 1).to(dtype=data_flat.dtype)
-    mask_fg = mask_fore_flat.reshape(-1, 1).to(dtype=data_flat.dtype)
-    n_bg_total = mask_bg.sum().clamp_min(1.0)
-    n_fg_total = mask_fg.sum().clamp_min(1.0)
-    loglh_old = None
-    for _ in range(max_iter_):
-        resp_bg = _calculate_resp_masked(X_col, mask_bg, pi[:n_back, 0], mu[:n_back, 0], sigma[:n_back, 0])
-        resp_fg = _calculate_resp_masked(X_col, mask_fg, pi[:n_fore, 1], mu[:n_fore, 1], sigma[:n_fore, 1])
-
-        # M-step
-        N_bg = resp_bg.sum(dim=0) + _TINY
-        N_fg = resp_fg.sum(dim=0) + _TINY
-
-        mu[:n_back, 0] = (1 / N_bg * (resp_bg * X_col)).sum(dim=0)
-        mu[:n_fore, 1] = (1 / N_fg * (resp_fg * X_col)).sum(dim=0)
-        sigma[:n_back, 0] = torch.sqrt((1 / N_bg * (resp_bg * (X_col - mu[:n_back, 0]) ** 2)).sum(dim=0)) + _TINY
-        sigma[:n_fore, 1] = torch.sqrt((1 / N_fg * (resp_fg * (X_col - mu[:n_fore, 1]) ** 2)).sum(dim=0)) + _TINY
-
-        pi[:n_back, 0] = N_bg / n_bg_total
-        pi[:n_fore, 1] = N_fg / n_fg_total
-
-        # Monitor inner EM convergence (optional)
-        loglh_bg = _loglh_gmm_masked(X_col, mask_back_flat.to(dtype=data_flat.dtype), pi[:n_back, 0], mu[:n_back, 0], sigma[:n_back, 0])
-        loglh_fg = _loglh_gmm_masked(X_col, mask_fore_flat.to(dtype=data_flat.dtype), pi[:n_fore, 1], mu[:n_fore, 1], sigma[:n_fore, 1])
-        loglh_new = loglh_bg + loglh_fg
-        if loglh_old is None:
-            loglh_old = loglh_new
-            continue
-        if torch.abs((loglh_new - loglh_old) / (loglh_new + _TINY)) < tol_:
-            break
-        loglh_old = loglh_new
-
-    return pi, mu, sigma
+    Slices the two classes out and defers to the single EM implementation.
+    This used to branch on the device: accelerators took the sliced path while
+    the CPU ran a separate masked implementation with its own convergence
+    monitor, so the same inputs produced different parameters — and therefore a
+    different mask — depending on the machine. Slicing versus masking is a
+    memory-layout choice, not a modelling one, so it must not decide the maths.
+    """
+    return _em_once_sliced(
+        data_flat[mask_fore_flat],
+        data_flat[mask_back_flat],
+        n_fore,
+        n_back,
+        pi,
+        mu,
+        sigma,
+        tol_=tol_,
+        max_iter_=max_iter_,
+    )
 
 
 def _em_monitor_sample(data: torch.Tensor, max_points: int) -> torch.Tensor:
@@ -531,6 +481,12 @@ def _em_once_sliced_device_convergence(
     """Run sliced EM while keeping convergence state on the accelerator."""
     data_back_col = data_back.reshape(-1, 1)
     data_fore_col = data_fore.reshape(-1, 1)
+    # Mixture weights divide by the class population. An empty class would
+    # give inf/nan rather than a finite weight, so floor the denominator at 1
+    # exactly as the masked path used to with `clamp_min(1.0)`. The sliced
+    # implementations divided by a raw `len(...)` and had no such floor.
+    n_back_total = max(int(data_back.reshape(-1).numel()), 1)
+    n_fore_total = max(int(data_fore.reshape(-1).numel()), 1)
     monitor_back = _em_monitor_sample(data_back, monitor_points)
     monitor_fore = _em_monitor_sample(data_fore, monitor_points)
     active = torch.ones((), dtype=torch.bool, device=data_fore.device)
@@ -553,8 +509,8 @@ def _em_once_sliced_device_convergence(
         candidate_sigma[:n_fore, 1] = torch.sqrt(
             (1 / N_fg * (resp_fg * (data_fore_col - candidate_mu[:n_fore, 1]) ** 2)).sum(dim=0)
         ) + _TINY
-        candidate_pi[:n_back, 0] = N_bg / len(data_back)
-        candidate_pi[:n_fore, 1] = N_fg / len(data_fore)
+        candidate_pi[:n_back, 0] = N_bg / n_back_total
+        candidate_pi[:n_fore, 1] = N_fg / n_fore_total
 
         # The converging update is retained, matching the host-side early-break
         # behavior. Once inactive, parameters remain frozen on the device.
@@ -592,49 +548,27 @@ def _em_once_sliced(
     tol_: float = 1e-6,
     max_iter_: int = 30,
 ):
-    """Original sliced EM path; faster for single large 3D volumes."""
-    if data_fore.device.type in {"mps", "cuda"}:
-        return _em_once_sliced_device_convergence(
-            data_fore,
-            data_back,
-            n_fore,
-            n_back,
-            pi,
-            mu,
-            sigma,
-            tol_=tol_,
-            max_iter_=max_iter_,
-        )
+    """Sliced EM. One implementation for every device.
 
-    loglh_old = None
-    data_back_col = data_back.reshape(-1, 1)
-    data_fore_col = data_fore.reshape(-1, 1)
-    for _ in range(max_iter_):
-        resp_bg = _calculate_resp(data_back, pi[:n_back, 0], mu[:n_back, 0], sigma[:n_back, 0])
-        resp_fg = _calculate_resp(data_fore, pi[:n_fore, 1], mu[:n_fore, 1], sigma[:n_fore, 1])
-
-        N_bg = resp_bg.sum(dim=0) + _TINY
-        N_fg = resp_fg.sum(dim=0) + _TINY
-
-        mu[:n_back, 0] = (1 / N_bg * (resp_bg * data_back_col)).sum(dim=0)
-        mu[:n_fore, 1] = (1 / N_fg * (resp_fg * data_fore_col)).sum(dim=0)
-        sigma[:n_back, 0] = torch.sqrt((1 / N_bg * (resp_bg * (data_back_col - mu[:n_back, 0]) ** 2)).sum(dim=0)) + _TINY
-        sigma[:n_fore, 1] = torch.sqrt((1 / N_fg * (resp_fg * (data_fore_col - mu[:n_fore, 1]) ** 2)).sum(dim=0)) + _TINY
-
-        pi[:n_back, 0] = N_bg / len(data_back)
-        pi[:n_fore, 1] = N_fg / len(data_fore)
-
-        loglh_bg = _loglh_gmm(data_back, pi[:n_back, 0], mu[:n_back, 0], sigma[:n_back, 0])
-        loglh_fg = _loglh_gmm(data_fore, pi[:n_fore, 1], mu[:n_fore, 1], sigma[:n_fore, 1])
-        loglh_new = loglh_bg + loglh_fg
-        if loglh_old is None:
-            loglh_old = loglh_new
-            continue
-        if torch.abs((loglh_new - loglh_old) / (loglh_new + _TINY)) < tol_:
-            break
-        loglh_old = loglh_new
-
-    return pi, mu, sigma
+    This used to run its own loop on the CPU and hand accelerators over to
+    `_em_once_sliced_device_convergence`, whose convergence monitor evaluates a
+    deterministic 65,536-point sample rather than every point. The two
+    therefore stopped at different iterations and returned different pi/mu/sigma
+    for identical inputs, so a mask was reproducible on one machine but not
+    across machines. The sampled monitor is now used everywhere: it is
+    deterministic and device-independent, which is what reproducibility needs.
+    """
+    return _em_once_sliced_device_convergence(
+        data_fore,
+        data_back,
+        n_fore,
+        n_back,
+        pi,
+        mu,
+        sigma,
+        tol_=tol_,
+        max_iter_=max_iter_,
+    )
 
 
 def _sample_1d_tensor(values: torch.Tensor, count: int) -> torch.Tensor:

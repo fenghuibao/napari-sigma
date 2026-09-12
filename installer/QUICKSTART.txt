@@ -16,8 +16,12 @@ INSTALL AND OPEN
 4. The SIGMA panel opens automatically. Use Open File or drag a TIFF into napari.
 5. Check channel, time, Z and physical pixel sizes before analysis.
 
-The panel displays: SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm).
-Application/window names remain SIGMA without a version suffix.
+The window title bar and the panel's own title bar both read:
+SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm).
+The application, Dock and shortcut names remain SIGMA, without a version suffix.
+The disk image and its mounted volume carry the SIGMA icon; Finder may still show
+a generic icon on the downloaded .dmg file, because that icon is metadata a
+download cannot carry.
 
 You do not need Python, conda, pip, or a terminal. The installer works offline.
 The installed runtime occupies more space than the compressed download.

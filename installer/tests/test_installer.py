@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,18 +26,101 @@ def module(name):
 
 
 build, install, launch, verify = (module(name) for name in ("build", "install", "launch", "verify"))
+mac_icon = module("mac_icon")
+sys.modules.setdefault("mac_icon", mac_icon)
 mac_app = module("mac_app")
 
 
 class InstallerTests(unittest.TestCase):
+    def make_dmg(self, root: Path):
+        """Run create_dmg with the OS utilities and Finder metadata stubbed."""
+        staging, output = root / "staging", root / "output"
+        staging.mkdir()
+        output.mkdir()
+        icns = root / "sigma.icns"
+        icns.write_bytes(b"icns-artwork")
+        dmg = output / "SIGMA.dmg"
+
+        def fake_run(command, **kwargs):
+            # Stand in for hdiutil attach, which is what puts the staged
+            # artwork under the mount point the icon flag is applied to.
+            if command[1] == "attach":
+                mount = Path(command[command.index("-mountpoint") + 1])
+                shutil.copy2(icns, mount / mac_icon.VOLUME_ICON_NAME)
+
+        with patch.object(mac_app, "run", side_effect=fake_run) as run, \
+                patch.object(mac_app.mac_icon, "mark_custom_icon") as mark, \
+                patch.object(mac_app.mac_icon, "set_file_icon") as set_file_icon:
+            mac_app.create_dmg(staging, dmg, icns)
+        commands = [call.args[0] for call in run.call_args_list]
+        return {"commands": commands, "staging": staging, "dmg": dmg, "icns": icns,
+                "mark": mark, "set_file_icon": set_file_icon,
+                "timeouts": [call.kwargs.get("timeout") for call in run.call_args_list]}
+
     def test_dmg_creation_has_diagnostics_and_a_bounded_timeout(self):
-        with patch.object(mac_app, "run") as run:
-            mac_app.create_dmg(Path("staging"), Path("SIGMA.dmg"))
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("-fs") + 1], "APFS")
-        self.assertIn("-verbose", command)
-        self.assertIn("-nospotlight", command)
-        self.assertEqual(run.call_args.kwargs["timeout"], 900)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.make_dmg(Path(directory))
+        create = next(c for c in result["commands"] if c[1] == "create")
+        self.assertEqual(create[create.index("-fs") + 1], "APFS")
+        self.assertIn("-verbose", create)
+        self.assertIn("-nospotlight", create)
+        self.assertTrue(all(timeout for timeout in result["timeouts"]))
+        self.assertEqual(max(result["timeouts"]), 900)
+
+    def test_dmg_is_written_read_write_then_compressed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.make_dmg(Path(directory))
+        verbs = [command[1] for command in result["commands"]]
+        self.assertEqual(verbs, ["create", "attach", "detach", "convert"])
+        create = next(c for c in result["commands"] if c[1] == "create")
+        convert = next(c for c in result["commands"] if c[1] == "convert")
+        # The icon flag can only be set on a writable, attached image, so the
+        # delivered file must still be produced by the compressing convert.
+        self.assertEqual(create[create.index("-format") + 1], "UDRW")
+        self.assertEqual(convert[convert.index("-format") + 1], "UDZO")
+        self.assertEqual(Path(convert[convert.index("-o") + 1]), result["dmg"])
+
+    def test_dmg_carries_volume_and_file_icons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.make_dmg(Path(directory))
+            staged = result["staging"] / mac_icon.VOLUME_ICON_NAME
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.read_bytes(), result["icns"].read_bytes())
+        # The volume root is flagged so Finder reads .VolumeIcon.icns, and the
+        # finished image gets the same artwork in its resource fork.
+        self.assertEqual(result["mark"].call_count, 1)
+        result["set_file_icon"].assert_called_once_with(result["dmg"], result["icns"])
+
+    def test_custom_icon_resource_fork_is_well_formed(self):
+        artwork = b"icns" + (28).to_bytes(4, "big") + b"payload-bytes-here!!"
+        fork = mac_icon.resource_fork(artwork)
+        data_offset, map_offset, data_length, map_length = struct.unpack(">IIII", fork[:16])
+        self.assertEqual(data_offset, 256)
+        self.assertEqual(map_offset, 256 + data_length)
+        self.assertEqual(len(fork), map_offset + map_length)
+        resource_map = fork[map_offset:map_offset + map_length]
+        type_list_offset, name_list_offset = struct.unpack(">HH", resource_map[24:28])
+        # An empty name list sits at the very end of the map.
+        self.assertEqual(name_list_offset, map_length)
+        type_list = resource_map[type_list_offset:]
+        self.assertEqual(struct.unpack(">H", type_list[:2])[0], 0)
+        self.assertEqual(type_list[2:6], b"icns")
+        count, reference_offset = struct.unpack(">HH", type_list[6:10])
+        self.assertEqual(count, 0)
+        reference = resource_map[type_list_offset + reference_offset:][:12]
+        resource_id, name_offset = struct.unpack(">hh", reference[:4])
+        self.assertEqual(resource_id, mac_icon.CUSTOM_ICON_RESOURCE_ID)
+        self.assertEqual(name_offset, -1)
+        start = data_offset + int.from_bytes(reference[5:8], "big")
+        length = struct.unpack(">I", fork[start:start + 4])[0]
+        self.assertEqual(fork[start + 4:start + 4 + length], artwork)
+
+    def test_custom_icon_finder_flag_is_the_only_bit_set(self):
+        info = mac_icon.finder_info()
+        self.assertEqual(len(info), 32)
+        self.assertEqual(struct.unpack(">H", info[8:10])[0], mac_icon.HAS_CUSTOM_ICON)
+        self.assertEqual(info[:8], b"\0" * 8)
+        self.assertEqual(info[10:], b"\0" * 22)
 
     def test_portable_python_archives_are_pinned_per_architecture(self):
         arm = mac_app.runtime_record("osx-arm64")
@@ -107,7 +192,9 @@ class InstallerTests(unittest.TestCase):
 
     def test_regression_fixture_outlives_local_memory_map(self):
         import mmap
-        spec = importlib.util.spec_from_file_location("fixtures", ROOT.parent / "tests/_fixtures.py")
+        default_source = ROOT.parent if (ROOT.parent / "tests/_fixtures.py").exists() else ROOT.parents[1] / "napari-sigma"
+        source = Path(os.environ.get("SIGMA_SOURCE_DIR", default_source))
+        spec = importlib.util.spec_from_file_location("fixtures", source / "tests/_fixtures.py")
         fixtures = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(fixtures)
         observed = []
@@ -179,7 +266,7 @@ class InstallerTests(unittest.TestCase):
                     self.assertFalse(config["register_python"])
                     self.assertEqual(config["uninstall_name"], "SIGMA")
                 else:
-                    self.assertEqual(config["pkg_name"], "sigma-0.0.5")
+                    self.assertEqual(config["pkg_name"], f"sigma-{build.VERSION}")
 
     def test_icons_use_supplied_artwork_in_all_native_formats(self):
         from PIL import Image

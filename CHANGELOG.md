@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.6 — Bug fixes
+
+- Restore TIFF calibration and units during file loading and drag-and-drop, while preserving edited pixels and explicit reader choices.
+- Fix repeated file opening and synchronize image information and processing inputs with the newly opened layer.
+- Preserve segmentation and structural-response metadata when saving and reopening TIFF files.
+- Correct analysis, tracking, proximity and segmentation edge cases; consolidate shared metadata and processing helpers.
+- Improve device selection and interface state synchronization.
+- Add regression coverage for calibration, repeated imports, cancelled/failed opens and preservation of existing data.
+
+This is a napari plugin release. No desktop installers, example datasets, diagnostic scripts or audit reports are included.
+
 ## 0.0.5
 
 - Fix the reader factory's parameter name to accept npe2's `path=` keyword, restoring SIGMA reads through napari's file-open/drop flow.

@@ -21,23 +21,39 @@ spec.loader.exec_module(desktop)
 
 
 class PlotPreparationTests(unittest.TestCase):
-    def test_full_name_is_exact_and_wraps_without_changing_app_name(self):
+    FULL_NAME = "SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)"
+
+    def test_full_name_titles_the_panel_without_changing_the_app_name(self):
         preparation = desktop.PlotPreparation(lambda: None)
-        viewer, panel = self.make_panel(preparation)
-        label = panel._desktop_full_name
-        self.assertEqual(label.text(), "SIGMA (Structurely-aware Intensity-ordered GMM-MRF Algorithm)")
-        self.assertTrue(label.wordWrap())
-        self.assertIs(panel.layout().itemAt(0).widget(), label)
-        self.assertNotIn("0.0.5", label.text())
+        viewer, panel, dock = self.make_panel(preparation)
+        self.assertEqual(desktop.FULL_NAME, self.FULL_NAME)
+        self.assertEqual(dock.windowTitle(), self.FULL_NAME)
+        self.assertEqual(panel.windowTitle(), self.FULL_NAME)
+        self.assertNotIn("0.0.5", dock.windowTitle())
+        # The name belongs to the title bars, not to a row above the panel.
+        # The scroll area holding the tabs is first again, as it is upstream.
+        self.assertFalse(hasattr(panel, "_desktop_full_name"))
+        self.assertIs(panel.layout().itemAt(0).widget(), panel._scroll)
+        self.assertEqual(panel.layout().count(), 1)
+        self.assertEqual(QApplication.instance().applicationDisplayName(), "SIGMA")
+
+    def test_window_title_carries_the_full_name(self):
+        preparation = desktop.PlotPreparation(lambda: None)
+        viewer, panel, dock = self.make_panel(preparation)
+        viewer.title = desktop.FULL_NAME
+        self.assertIn(self.FULL_NAME, viewer.window._qt_window.windowTitle())
 
     def make_panel(self, preparation):
         viewer = napari.Viewer(show=False)
+        # Viewer creates the application's first Qt instance in a fresh test
+        # process. Do not assume another test has already constructed one.
+        QApplication.instance().setApplicationDisplayName("SIGMA")
         panel = desktop.DesktopSIGMAWidget(viewer, plot_preparation=preparation)
-        viewer.window.add_dock_widget(panel, name="SIGMA")
+        dock = viewer.window.add_dock_widget(panel, name=desktop.FULL_NAME)
         self.addCleanup(viewer.close)
         self.addCleanup(panel.close)
         self.addCleanup(panel.dispose)
-        return viewer, panel
+        return viewer, panel, dock
 
     def process_until(self, condition, timeout=20, diagnostics=None):
         end = time.monotonic() + timeout
@@ -59,7 +75,7 @@ class PlotPreparationTests(unittest.TestCase):
             release.wait()
             desktop.prepare_plot_modules()
         preparation = desktop.PlotPreparation(prepare)
-        viewer, panel = self.make_panel(preparation)
+        viewer, panel, _ = self.make_panel(preparation)
         beats = []
         timer = QTimer(panel)
         timer.setInterval(10)
@@ -96,7 +112,7 @@ class PlotPreparationTests(unittest.TestCase):
         release = threading.Event()
         self.addCleanup(release.set)
         preparation = desktop.PlotPreparation(release.wait)
-        viewer, panel = self.make_panel(preparation)
+        viewer, panel, _ = self.make_panel(preparation)
         panel.dispose()
         self.assertFalse(panel._desktop_plot_timer.isActive())
         self.assertFalse(preparation.done.is_set())
@@ -108,7 +124,7 @@ class PlotPreparationTests(unittest.TestCase):
         def fail():
             raise ImportError("test font load failure")
         preparation = desktop.PlotPreparation(fail)
-        viewer, panel = self.make_panel(preparation)
+        viewer, panel, _ = self.make_panel(preparation)
         panel._panel_tabs.setCurrentWidget(panel._analysis_tab)
         self.process_until(lambda: panel._desktop_plot_error is not None)
         self.assertIn("test font load failure", panel._analysis_plot_placeholder.text())

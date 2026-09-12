@@ -211,6 +211,18 @@ class FrangiFilter(nn.Module):
                     device=self.device,
                 )
 
+    @property
+    def sheetness_is_substituted(self) -> bool:
+        """True when a sheetness request can only return vesselness.
+
+        A 2D Hessian has two eigenvalues, so sheetness is undefined; the 2D
+        branch of `_response_from_eigenvalues` returns vesselness instead.
+        This is also reached for a 3D stack whose Z extent is too thin to
+        filter in 3D, so callers must report the substitution rather than
+        labelling the output "sheetness".
+        """
+        return int(self.dim) == 2 and str(self.response_mode) in {"sheetness", "combined"}
+
     @staticmethod
     def _sigma_key(sigma):
         return f"{float(sigma):.8f}".replace(".", "_")
@@ -347,7 +359,11 @@ class FrangiFilter(nn.Module):
             sheetness = sheetness * structuredness
             sheetness = torch.where(lambda3_signed > 0, sheetness, torch.zeros_like(sheetness))
         else:
-            # Sheetness is not well-defined for a single 2D Hessian plane.
+            # Sheetness needs three eigenvalues to separate one strong normal
+            # curvature from two weak tangential ones. A 2D Hessian has only
+            # two, so there is nothing to compute and vesselness is the only
+            # available response. Callers must say so rather than presenting
+            # the result as sheetness: see `sheetness_is_substituted`.
             sheetness = vesselness
 
         if self.response_mode == "sheetness":

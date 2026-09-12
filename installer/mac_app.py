@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import tempfile
 
+import mac_icon
+
 HERE = Path(__file__).resolve().parent
 RELEASE = "20260901"
 RUNTIMES = {
@@ -108,12 +110,48 @@ def sign_app(app):
     run(["/usr/bin/codesign", "--verify", "--deep", "--strict", app])
 
 
-def create_dmg(staging, dmg):
+def detach(mount):
+    # A lingering Spotlight/Finder probe can hold a new volume briefly.
+    for attempt, command in enumerate([["/usr/bin/hdiutil", "detach", mount],
+                                       ["/usr/bin/hdiutil", "detach", "-force", mount]]):
+        try:
+            return run(command, timeout=300)
+        except subprocess.CalledProcessError:
+            if attempt:
+                raise
+            print("Retrying detach with -force…", flush=True)
+
+
+def create_dmg(staging, dmg, icns):
     # macOS 14+ supports APFS. Avoid the legacy HFS+ creation path, which
     # stalled on the Intel macOS 15 runner; retain verbose output and bound
-    # this OS utility so a filesystem/runner fault cannot wait indefinitely.
-    run(["/usr/bin/hdiutil", "create", "-volname", "SIGMA", "-srcfolder", staging,
-         "-format", "UDZO", "-fs", "APFS", "-nospotlight", "-verbose", dmg], timeout=900)
+    # these OS utilities so a filesystem/runner fault cannot wait indefinitely.
+    #
+    # The volume artwork is staged before creation so the image is sized for
+    # it; only the kHasCustomIcon flag, which no -srcfolder copy carries, is
+    # applied while the read/write image is attached. The finished image is
+    # then compressed exactly as before.
+    mac_icon.stage_volume_icon(staging, icns)
+    with tempfile.TemporaryDirectory(prefix="sigma-dmg-", dir=dmg.parent) as directory:
+        scratch = Path(directory)
+        writable = scratch / "writable.dmg"
+        run(["/usr/bin/hdiutil", "create", "-volname", "SIGMA", "-srcfolder", staging,
+             "-format", "UDRW", "-fs", "APFS", "-nospotlight", "-verbose", writable], timeout=900)
+        mount = scratch / "mount"
+        mount.mkdir()
+        run(["/usr/bin/hdiutil", "attach", writable, "-mountpoint", mount,
+             "-nobrowse", "-noautoopen", "-verbose"], timeout=900)
+        try:
+            mac_icon.mark_custom_icon(mount)
+            if not (mount / mac_icon.VOLUME_ICON_NAME).is_file():
+                raise RuntimeError("The disk image is missing its volume icon artwork")
+        finally:
+            detach(mount)
+        run(["/usr/bin/hdiutil", "convert", writable, "-format", "UDZO", "-o", dmg], timeout=900)
+    # Finder keeps a file's icon in its resource fork. This is metadata, so it
+    # is lost when the image is zipped or downloaded; the volume icon above
+    # travels inside the image and always survives.
+    mac_icon.set_file_icon(dmg, icns)
 
 
 def build_app(target, version, work, payload, output):
@@ -151,7 +189,7 @@ def build_app(target, version, work, payload, output):
     # needed at runtime. Do not ship the old external-prefix install machinery.
     desktop = prefix / "sigma-desktop"
     desktop.mkdir()
-    for name in ("launch.py", "desktop_widget.py", "font_cache.py", "QUICKSTART.txt",
+    for name in ("launch.py", "desktop_widget.py", "font_cache.py", "mac_window.py", "QUICKSTART.txt",
                  "NOTICE.txt", "SIGMA-LICENSE.txt", "requirements.lock", "bundle.json",
                  "sigma.png", "sigma.icns", "sigma.ico"):
         shutil.copy2(payload / name, desktop / name)
@@ -167,13 +205,15 @@ def build_app(target, version, work, payload, output):
          "-I", prefix / f"include/python{minor}", "-L", prefix / "lib", f"-lpython{minor}",
          "-Wl,-rpath,@executable_path/../Resources/runtime/lib", HERE / "mac_launcher.m",
          "-o", native / "SIGMA"])
+    run(["/usr/bin/clang", "-fobjc-arc", "-dynamiclib", "-mmacosx-version-min=14.0",
+         "-framework", "Cocoa", HERE / "mac_titlebar.m", "-o", desktop / "mac_titlebar.dylib"])
     check_internal_links(app)
     sign_app(app)
     (staging / "Applications").symlink_to("/Applications", target_is_directory=True)
     shutil.copy2(HERE / "QUICKSTART.txt", staging / "READ ME.txt")
     arch = "AppleSilicon" if target == "osx-arm64" else "Intel"
     dmg = output / f"SIGMA-{version}-macOS-{arch}-unsigned.dmg"
-    create_dmg(staging, dmg)
+    create_dmg(staging, dmg, payload / "sigma.icns")
     with dmg.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     dmg.with_suffix(".dmg.sha256").write_text(f"{digest}  {dmg.name}\n", encoding="utf-8")

@@ -1,6 +1,6 @@
 """Build offline SIGMA installers on each target OS/architecture.
 
-The published core wheel is unchanged. A small desktop launcher is shipped
+The current source checkout is packaged unchanged. A small desktop launcher is shipped
 alongside a private Python runtime and a hash-locked wheelhouse.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ import zipfile
 import yaml
 
 HERE = Path(__file__).resolve().parent
-VERSION = "0.0.5"
+VERSION = "0.0.6"
 PLATFORMS = {"osx-arm64", "osx-64", "win-64"}
 
 
@@ -86,10 +86,10 @@ def lock_wheels(wheelhouse: Path, destination: Path) -> list[dict]:
     return records
 
 
-def validated_cached_wheels(payload: Path, target: str) -> list[dict]:
+def validated_cached_wheels(payload: Path, target: str, *, version=None) -> list[dict]:
     """Reuse only the exact previously resolved wheel set, with no downloads."""
     bundle = json.loads((payload / "bundle.json").read_text(encoding="utf-8"))
-    if bundle["platform"] != target or bundle["sigma_version"] != VERSION:
+    if bundle["platform"] != target or bundle["sigma_version"] != (version or VERSION):
         raise ValueError("Cached bundle is for a different platform or SIGMA version")
     with tempfile.TemporaryDirectory() as directory:
         lock = Path(directory) / "requirements.lock"
@@ -204,6 +204,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--source-dir", type=Path, required=True,
+                        help="Current core checkout, built and verified byte-for-byte")
     parser.add_argument("--conda", default=shutil.which("conda"))
     parser.add_argument("--constructor", default=shutil.which("constructor"))
     parser.add_argument("--standalone-conda", type=Path,
@@ -226,6 +228,19 @@ def main():
     wheels = payload / "wheelhouse"
     for path in (work, output, wheels):
         path.mkdir(parents=True, exist_ok=True)
+    source = args.source_dir.resolve()
+    local_wheels = work / "current-core"
+    local_wheels.mkdir(exist_ok=True)
+    run([sys.executable, "-I", "-B", "-m", "pip", "--isolated", "wheel",
+         "--no-deps", "--no-build-isolation", "--no-cache-dir",
+         "--disable-pip-version-check", "--wheel-dir", local_wheels, source])
+    from build_current_macos import verify_source_wheel, digest
+    local_core = list(local_wheels.glob("*.whl"))
+    if len(local_core) != 1:
+        raise ValueError("Expected one wheel built from the current source")
+    version, core_files = verify_source_wheel(source, local_core[0])
+    if version != VERSION:
+        raise ValueError(f"Update the packaging version to match the source: {version}")
     if not (runtime / "conda-meta" / "history").is_file():
         if args.reuse_wheelhouse:
             parser.error("--reuse-wheelhouse requires an existing runtime and payload")
@@ -242,20 +257,40 @@ def main():
         download += ["--platform", "macosx_14_0_" + ("arm64" if target == "osx-arm64" else "x86_64")]
     if args.reuse_wheelhouse:
         records = validated_cached_wheels(payload, target)
+        cached_core = next(record for record in records if record["name"] == "napari-sigma")
+        verify_source_wheel(source, wheels / cached_core["filename"])
     else:
         if target == "win-64":
             run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
-        run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requirements(target))
+        # Passing the local wheel explicitly prevents same-version PyPI code
+        # from replacing current interface edits during dependency resolution.
+        requested = [f"{local_core[0]}[all]"] + requirements(target)[1:]
+        run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requested)
         records = lock_wheels(wheels, payload / "requirements.lock")
+    core_record = next(record for record in records if record["name"] == "napari-sigma")
+    verify_source_wheel(source, wheels / core_record["filename"])
+    provenance = {
+        "source_commit": subprocess.check_output(["git", "-C", source, "rev-parse", "HEAD"], text=True).strip(),
+        "core_files": core_files, "core_wheel": core_record,
+        "desktop_files": {name: digest(HERE / name) for name in
+                          ("launch.py", "desktop_widget.py", "font_cache.py", "mac_window.py",
+                           "mac_titlebar.m", "mac_launcher.m", "assets/sigma-logo.png")},
+    }
+    (output / "source-provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
     font_cache = build_font_index(python, work, payload, records)
-    for name in ("launch.py", "desktop_widget.py", "font_cache.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
+    for name in ("launch.py", "desktop_widget.py", "font_cache.py", "mac_window.py", "install.py", "QUICKSTART.txt", "NOTICE.txt"):
         shutil.copy2(HERE / name, payload / name)
-    shutil.copy2(HERE.parent / "LICENSE", payload / "SIGMA-LICENSE.txt")
+    shutil.copy2(source / "LICENSE", payload / "SIGMA-LICENSE.txt")
     make_icons(payload)
     (payload / "menu.json").write_text(json.dumps(menu_metadata(VERSION), indent=2), encoding="utf-8")
     (payload / "bundle.json").write_text(json.dumps({
         "schema": 1, "sigma_version": VERSION, "platform": target,
-        "default_device": "auto" if target == "osx-arm64" else "cpu",
+        "source_commit": provenance["source_commit"],
+        "core_wheel_sha256": core_record["sha256"],
+        # The panel lists only devices torch reports as usable, best first, so
+        # there is no "auto" to request. Naming the platform's likely
+        # accelerator is enough; launch.py ignores a device that is absent.
+        "default_device": "mps" if target == "osx-arm64" else "cpu",
         "branding": {"name": "SIGMA", "logo_sha256": hashlib.sha256((payload / "sigma.png").read_bytes()).hexdigest()},
         "font_cache": font_cache,
         "signed": False, "wheels": records,
