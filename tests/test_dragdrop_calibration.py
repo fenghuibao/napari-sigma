@@ -32,12 +32,24 @@ class NativeTiffCalibration(unittest.TestCase):
                                                 "finterval": 72.579},
                          resolution=((9_087_619, 1_000_000), (9_087_619, 1_000_000)))
         self.viewer = self.napari.Viewer(show=False)
-        self.addCleanup(self.viewer.close)
+        self.addCleanup(self._close_viewer)
+
+    def _close_viewer(self):
+        self.viewer.close()
+        self.viewer = None
+        self.App.processEvents()
 
     def panel(self):
+        from qtpy.QtCore import QEvent
         panel = self.Widget(self.viewer)
-        self.addCleanup(panel.close)
-        self.addCleanup(panel.dispose)
+        def cleanup():
+            panel.dispose()
+            # close() only hides a QWidget. Its combo-box item data can still
+            # own TIFF-backed layers until the native controls are destroyed.
+            self.viewer.window.remove_dock_widget(panel)
+            panel.deleteLater()
+            self.App.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.addCleanup(cleanup)
         self.viewer.window.add_dock_widget(panel, name="SIGMA regression")
         return panel
 

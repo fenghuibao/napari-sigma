@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: desktop-${{ github.ref }}-${{ github.sha }}-${{ inputs.targets }}
@@ -28,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      windows-run: ${{ steps.select.outputs.windows-run }}
     steps:
       - id: select
         shell: python
@@ -53,9 +55,13 @@ jobs:
           if unknown:
               raise SystemExit(f"Unknown build target(s) {unknown}; choose from {list(platforms)} or {list(groups)}")
           chosen = [platforms[name] for name in dict.fromkeys(names)]
+          reuse = re.search(r"\[verify-windows:(\d+)\]", message)
+          if reuse and names != ["win-64"]:
+              raise SystemExit("An existing Windows artifact can only be tested with win-64")
           print(f"Building: {[entry['target'] for entry in chosen]}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"matrix={json.dumps(chosen)}\n")
+              output.write(f"windows-run={reuse.group(1) if reuse else ''}\n")
 
   build-and-install:
     needs: select-targets
@@ -82,7 +88,32 @@ jobs:
       - name: Packaging unit tests
         run: python -m unittest discover -s installer/tests -v
       - name: Build offline installer
+        if: needs.select-targets.outputs.windows-run == ''
         run: python installer/build.py --source-dir "$GITHUB_WORKSPACE" --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
+      - name: Retrieve existing Windows package for test-only changes
+        if: needs.select-targets.outputs.windows-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGMA_ARTIFACT_RUN: ${{ needs.select-targets.outputs.windows-run }}
+        run: gh run download "$SIGMA_ARTIFACT_RUN" --repo "$GITHUB_REPOSITORY" --name SIGMA-0.0.6-win-64-unsigned --dir dist-desktop
+      - name: Verify reused package integrity and current source
+        if: needs.select-targets.outputs.windows-run != ''
+        shell: python
+        run: |
+          import hashlib, json, pathlib, shutil
+          root = pathlib.Path('dist-desktop')
+          source = json.loads((root / 'source-provenance.json').read_text())
+          for relative, expected in source['core_files'].items():
+              assert hashlib.sha256((pathlib.Path('src') / relative).read_bytes()).hexdigest() == expected, relative
+          for relative, expected in source['desktop_files'].items():
+              assert hashlib.sha256((pathlib.Path('installer') / relative).read_bytes()).hexdigest() == expected, relative
+          package, = root.glob('*Windows*.zip')
+          with package.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == package.with_suffix('.zip.sha256').read_text().split()[0]
+          # Previous test outputs must never be mistaken for this run's results.
+          for name in ('verification', 'diagnostics'):
+              if (root / name).exists():
+                  shutil.rmtree(root / name)
       - name: Collect failed macOS disk-image diagnostics
         if: failure() && runner.os == 'macOS'
         run: |
