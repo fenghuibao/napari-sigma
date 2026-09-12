@@ -24,6 +24,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 VERSION = "0.0.6"
 PLATFORMS = {"osx-arm64", "osx-64", "win-64"}
+WINDOWS_TORCH = "2.13.0+cu130"
+WINDOWS_TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 
 
 def native_platform() -> str:
@@ -45,7 +47,7 @@ def requirements(target: str) -> list[str]:
     # That wheel must use NumPy 1.x; it is tested separately from modern Torch.
     torch = "2.2.2" if target == "osx-64" else "2.13.0"
     if target == "win-64":
-        torch += "+cpu"
+        torch = WINDOWS_TORCH
     result = [
         f"napari-sigma[all]=={VERSION}", "napari==0.9.0",
         f"torch=={torch}", f"numpy=={'1.26.4' if target == 'osx-64' else '2.5.2'}",
@@ -171,12 +173,13 @@ def constructor_config(target: str, runtime: Path, payload: Path) -> dict:
         "keep_pkgs": False,
         "build_outputs": [{"hash": {"algorithm": "sha256"}}, "info.json", "pkgs_list"],
         "extra_files": [{str(path): str(Path("sigma-desktop") / path.relative_to(payload))}
-                        for path in sorted(payload.rglob("*")) if path.is_file()],
+                        for path in sorted(payload.rglob("*")) if path.is_file()
+                        and not (target == "win-64" and path.is_relative_to(payload / "wheelhouse"))],
         "post_install": str(HERE / ("post_install.bat" if target == "win-64" else "post_install.sh")),
     }
     if target == "win-64":
         config.update(
-            installer_type="exe", installer_filename=f"SIGMA-{VERSION}-Windows-x64-CPU-unsigned.exe",
+            installer_type="exe", installer_filename="SIGMA-Setup.exe",
             default_prefix=f"%LOCALAPPDATA%\\SIGMA\\{VERSION}",
             default_prefix_domain_user=f"%LOCALAPPDATA%\\SIGMA\\{VERSION}",
             default_prefix_all_users=f"%ALLUSERSPROFILE%\\SIGMA\\{VERSION}",
@@ -198,6 +201,25 @@ def constructor_config(target: str, runtime: Path, payload: Path) -> dict:
             conclusion_text="Open SIGMA from your Applications folder. This test installer is not notarized.",
         )
     return config
+
+
+def package_windows(output: Path, wheelhouse: Path) -> Path:
+    """Keep the CUDA payload outside NSIS's 2 GiB executable limit, in one ZIP."""
+    setup = output / "SIGMA-Setup.exe"
+    if not setup.is_file():
+        raise ValueError("Windows setup executable is missing")
+    destination = output / f"SIGMA-{VERSION}-Windows-x64-CUDA-CPU-unsigned.zip"
+    # Wheels and the EXE are already compressed. ZIP64 works with Explorer's
+    # Extract All; archive.write streams even multi-gigabyte CUDA wheels.
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        archive.write(setup, setup.name)
+        archive.write(output / "QUICKSTART.txt", "QUICKSTART.txt")
+        for wheel in sorted(wheelhouse.glob("*.whl")):
+            archive.write(wheel, f"wheelhouse/{wheel.name}")
+    with destination.open("rb") as stream:
+        sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+    destination.with_suffix(".zip.sha256").write_text(f"{sha256}  {destination.name}\n", encoding="utf-8")
+    return destination
 
 
 def main():
@@ -261,13 +283,15 @@ def main():
         verify_source_wheel(source, wheels / cached_core["filename"])
     else:
         if target == "win-64":
-            run(download + ["--no-deps", "--index-url", "https://download.pytorch.org/whl/cpu", "torch==2.13.0+cpu"])
+            run(download + ["--no-deps", "--index-url", WINDOWS_TORCH_INDEX, f"torch=={WINDOWS_TORCH}"])
         # Passing the local wheel explicitly prevents same-version PyPI code
         # from replacing current interface edits during dependency resolution.
         requested = [f"{local_core[0]}[all]"] + requirements(target)[1:]
         run(download + ["--index-url", "https://pypi.org/simple", "--find-links", wheels] + requested)
         records = lock_wheels(wheels, payload / "requirements.lock")
     core_record = next(record for record in records if record["name"] == "napari-sigma")
+    if target == "win-64" and next(record["version"] for record in records if record["name"] == "torch") != WINDOWS_TORCH:
+        raise ValueError("Windows requires the CUDA-enabled Torch wheel; use a fresh build directory")
     verify_source_wheel(source, wheels / core_record["filename"])
     provenance = {
         "source_commit": subprocess.check_output(["git", "-C", source, "rev-parse", "HEAD"], text=True).strip(),
@@ -290,7 +314,8 @@ def main():
         # The panel lists only devices torch reports as usable, best first, so
         # there is no "auto" to request. Naming the platform's likely
         # accelerator is enough; launch.py ignores a device that is absent.
-        "default_device": "mps" if target == "osx-arm64" else "cpu",
+        "default_device": {"osx-arm64": "mps", "osx-64": "cpu", "win-64": "cuda"}[target],
+        "wheelhouse_location": "next-to-installer" if target == "win-64" else "bundled",
         "branding": {"name": "SIGMA", "logo_sha256": hashlib.sha256((payload / "sigma.png").read_bytes()).hexdigest()},
         "font_cache": font_cache,
         "signed": False, "wheels": records,
@@ -310,6 +335,9 @@ def main():
                 env["CONDA_OFFLINE"] = "true"
             run([args.constructor, "--conda-exe", args.standalone_conda,
                  "--output-dir", output, "--cache-dir", work / "constructor-cache", work], env=env)
+            package_windows(output, wheels)
+            # The EXE alone is incomplete. Deliver only the complete offline ZIP.
+            (output / "SIGMA-Setup.exe").unlink()
     print(f"Bundle prepared for {target}: {output}", flush=True)
 
 

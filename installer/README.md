@@ -2,7 +2,8 @@
 
 For the current 0.0.6 Apple Silicon app, use the [local-source build](#current-local-source-apple-silicon-build)
 instructions below. They preserve the canonical checkout's current UI wording.
-The older cross-platform instructions in the next section are historical.
+The current cross-platform builder also takes an explicit current source checkout.
+Windows bundles CUDA and CPU together; it does not constrain SIGMA to CPU-only.
 
 The current Apple Silicon title-alignment update is in
 `../../SIGMA-Desktop-0.0.6/centered-title/`. `mac_window.py` and the small
@@ -12,9 +13,9 @@ Native close/minimize/fullscreen controls are retained. The geometry regression
 measures the actual AppKit title at several window widths, and the native
 launcher smoke test checks the packaged app's title center as well.
 
-## Historical cross-platform packaging reference
+## Cross-platform packaging
 
-Native, offline installers for the **unchanged published napari-sigma 0.0.5 wheel**.
+Native, offline installers for the **unchanged current napari-sigma 0.0.6 source**.
 The desktop launcher opens napari and the SIGMA panel automatically. No terminal,
 Python installation, shell initialization, or administrator rights are needed for
 a per-user installation. On macOS, drag the app from its DMG into Applications
@@ -70,10 +71,23 @@ PyPI plugin does not acquire this desktop adapter automatically.
 | --- | --- | --- | --- |
 | Apple Silicon | Python 3.13, Torch 2.13, NumPy 2.5 | auto (MPS/CPU) | macOS 14 |
 | Intel Mac | Python 3.11, Torch 2.2.2, NumPy 1.26 | CPU | macOS 14 |
-| Windows x64 | Python 3.13, Torch 2.13 CPU, NumPy 2.5 | CPU | Windows 10/11 |
+| Windows x64 | Python 3.13, Torch 2.13 + CUDA 13.0, NumPy 2.5 | CUDA when available, otherwise CPU | Windows 10/11 |
 
-Intel uses the last available official Intel macOS Torch wheels. Windows CUDA and
-Windows ARM are not included. Separate backends are not promised bit-identical.
+Intel uses the last available official Intel macOS Torch wheels. Windows ARM is
+not included. Separate backends are not promised bit-identical.
+Windows downloads Torch from the official cu130 wheel index. It contains both
+CPU and CUDA code; users need a supported NVIDIA GPU/driver for acceleration, not
+a separate CUDA Toolkit. SIGMA's original device selection stays unchanged.
+CUDA hardware execution is reported as untested on GPU-less CI, separately from
+the verified CUDA-enabled runtime and CPU fallback.
+
+The Windows download is a ZIP containing SIGMA-Setup.exe and a hash-locked
+wheelhouse. Extract All, then double-click setup; no terminal is needed. Keeping
+the large CUDA payload outside the EXE avoids NSIS's 2 GiB limit. Constructor
+supplies INSTALLER_PATH from the actual executable path. Before any pip install,
+all payload hashes are checked against the manifest embedded in the EXE; pip
+then installs offline with --require-hashes. CI removes the extracted download
+before testing the installed app, to verify it is self-contained.
 Intel TIFF I/O uses tifffile 2026.3.3, which still supports Python 3.11/NumPy 1.x
 and includes the upstream high-resolution rational rounding fix. Calibration
 tests retain the same precision thresholds as the modern platforms.
@@ -89,7 +103,7 @@ Use a clean conda-forge build environment with Python 3.13, constructor 3.16.1,
 conda-standalone, menuinst 2.5.2, Pillow, and PyYAML. Run on the **target architecture**:
 
 ```sh
-python installer/build.py --work-dir /path/to/empty-build-dir --output-dir dist-desktop
+python installer/build.py --source-dir /path/to/napari-sigma --work-dir /path/to/empty-build-dir --output-dir dist-desktop
 python -m unittest discover -s installer/tests -v
 ```
 

@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: desktop-${{ github.ref }}-${{ inputs.targets }}
-  cancel-in-progress: true
+  group: desktop-${{ github.ref }}-${{ github.sha }}-${{ inputs.targets }}
+  cancel-in-progress: false
 
 jobs:
   select-targets:
@@ -97,11 +97,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $package = (Get-ChildItem dist-desktop/*.exe).FullName
+          $download = (Get-ChildItem dist-desktop/*Windows*.zip).FullName
+          $extracted = "$env:RUNNER_TEMP\SIGMA Offline Installer"
+          Expand-Archive -LiteralPath $download -DestinationPath $extracted
+          $package = Join-Path $extracted 'SIGMA-Setup.exe'
           $prefix = "$env:LOCALAPPDATA\SIGMA Desktop Test\0.0.6"
           $proc = Start-Process -FilePath $package -ArgumentList "/S /InstallationType=JustMe /AddToPath=0 /RegisterPython=0 /D=$prefix" -Wait -PassThru
           if ($proc.ExitCode -ne 0) { throw "Installer failed with exit code $($proc.ExitCode)" }
           "SIGMA_TEST_PREFIX=$prefix" >> $env:GITHUB_ENV
+          # The installed app must work after the download/payload is removed.
+          Remove-Item -LiteralPath $extracted -Recurse -Force
       - name: Prepare Windows runner OpenGL display
         if: runner.os == 'Windows'
         shell: pwsh

@@ -87,6 +87,8 @@ def main():
         [python, "-I", "-m", "unittest", "discover", "-s", args.source_dir.resolve() / "tests", "-v"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "gui_tests", "-v"],
         [python, "-I", "-m", "unittest", "discover", "-s", Path(__file__).resolve().parent / "font_tests", "-v"],
+        [python, "-I", Path(__file__).resolve().parent / "probe_runtime.py", "--resources", resources,
+         "--output", output / "compute-runtime.json"],
     ]
     for index, command in enumerate(commands):
         command.insert(2, "-B")

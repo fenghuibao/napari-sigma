@@ -1,6 +1,5 @@
 """Native-reader TIFF calibration must not require reloading image pixels."""
 from pathlib import Path
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -9,6 +8,7 @@ import numpy as np
 import tifffile
 
 from napari_sigma._image_io import read_tiff_layer_calibration
+from _fixtures import temporary_directory
 
 XY = 1_000_000 / 9_087_619  # WT_1.tif's exact X/YResolution rationals.
 
@@ -24,9 +24,8 @@ class NativeTiffCalibration(unittest.TestCase):
         cls.napari, cls.Widget, cls.App = napari, SIGMAWidget, QApplication
 
     def setUp(self):
-        directory = tempfile.TemporaryDirectory(prefix="sigma-calibration-")
-        self.addCleanup(directory.cleanup)
-        self.path = str(Path(directory.name) / "imagej.tif")
+        with temporary_directory(self) as directory:
+            self.path = str(Path(directory) / "imagej.tif")
         self.shape = (2, 3, 8, 9)
         tifffile.imwrite(self.path, np.arange(np.prod(self.shape), dtype=np.uint16).reshape(self.shape),
                          imagej=True, metadata={"axes": "TZYX", "unit": "micron", "spacing": .2,

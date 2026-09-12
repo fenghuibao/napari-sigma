@@ -3,14 +3,20 @@ SIGMA Desktop - test installers
 CHOOSE YOUR DOWNLOAD
 - macOS AppleSilicon: M-series Macs, macOS 14 or later; CPU/MPS.
 - macOS Intel: Intel Macs, macOS 14 or later; defaults to CPU.
-- Windows x64 CPU: 64-bit Intel/AMD Windows 10/11; no CUDA setup required.
-  This is not a Windows ARM64 build. NVIDIA acceleration is not included.
+- Windows x64 CUDA + CPU: 64-bit Intel/AMD Windows 10/11.
+  Both compute backends are included; SIGMA lists the devices usable on your PC.
+  CUDA needs a compatible NVIDIA GPU and driver; CPU works without an NVIDIA GPU.
+  The CUDA runtime is included. No separate CUDA Toolkit installation is needed.
+  This is not a Windows ARM64 build. MPS is available only on supported Macs.
 
 INSTALL AND OPEN
 1. Mac: open the DMG and drag SIGMA.app to Applications, then eject the DMG.
    Python and all analysis dependencies are inside SIGMA.app, not /Library.
    You may also copy the complete app to your personal Applications folder.
-   Windows: double-click the EXE and follow the installer.
+   Windows: right-click the ZIP > Extract All. Open the extracted folder and
+   double-click SIGMA-Setup.exe, leaving its wheelhouse folder beside it.
+   Do not launch the EXE from inside the ZIP. After installation, you can delete
+   the ZIP and extracted installer folder; SIGMA has its own complete runtime.
 2. Windows runtime installation may take several minutes. Mac needs only copying.
 3. Open "SIGMA" from Applications (Mac) or Start/Desktop (Windows).
 4. The SIGMA panel opens automatically. Use Open File or drag a TIFF into napari.
@@ -25,6 +31,9 @@ download cannot carry.
 
 You do not need Python, conda, pip, or a terminal. The installer works offline.
 The installed runtime occupies more space than the compressed download.
+Windows includes PyTorch 2.13.0 with CUDA 13.0; allow 15 GB of free space during
+installation. CUDA 13 requires an NVIDIA driver from branch 580 or newer and a
+GPU supported by this PyTorch build. Older GPUs/drivers may require CPU mode.
 Intel Mac uses an older compatible PyTorch/NumPy combination; results across
 different devices or dependency versions are not promised to be bit-identical.
 

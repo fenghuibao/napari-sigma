@@ -163,7 +163,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("numpy==1.26.4", intel)
         self.assertIn("torch==2.2.2", intel)
         self.assertIn("tifffile==2026.3.3", intel)
-        self.assertIn("torch==2.13.0+cpu", build.requirements("win-64"))
+        self.assertIn("torch==2.13.0+cu130", build.requirements("win-64"))
         self.assertIn("torch==2.13.0", build.requirements("osx-arm64"))
         self.assertTrue(all("matplotlib==3.11.1" in build.requirements(target) for target in build.PLATFORMS))
 
@@ -260,7 +260,8 @@ class InstallerTests(unittest.TestCase):
                 self.assertFalse(config["register_envs"])
                 self.assertEqual(config["menu_packages"], [])
                 self.assertIn({"hash": {"algorithm": "sha256"}}, config["build_outputs"])
-                self.assertIn("unsigned", config["installer_filename"])
+                if target != "win-64":
+                    self.assertIn("unsigned", config["installer_filename"])
                 self.assertEqual(list(config["extra_files"][0].values()), ["sigma-desktop/payload.txt"] if os.name != "nt" else ["sigma-desktop\\payload.txt"])
                 if target == "win-64":
                     self.assertFalse(config["register_python"])
@@ -330,6 +331,59 @@ class InstallerTests(unittest.TestCase):
     def test_installer_cannot_modify_unrelated_python(self):
         with self.assertRaisesRegex(RuntimeError, "own bundled Python"):
             install.install_prefix()
+
+    def test_windows_cuda_payload_is_not_embedded_in_small_exe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "wheelhouse").mkdir()
+            (root / "wheelhouse/torch.whl").write_bytes(b"cuda")
+            (root / "bundle.json").write_text("{}")
+            config = build.constructor_config("win-64", root / "runtime", root)
+            included = [path for record in config["extra_files"] for path in record]
+            self.assertEqual(included, [str(root / "bundle.json")])
+            self.assertEqual(config["installer_filename"], "SIGMA-Setup.exe")
+
+    def test_windows_zip_contains_setup_and_offline_wheels_with_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = root / "wheelhouse"
+            wheels.mkdir()
+            (wheels / "torch.whl").write_bytes(b"cuda")
+            (root / "SIGMA-Setup.exe").write_bytes(b"setup")
+            (root / "QUICKSTART.txt").write_text("Extract All")
+            download = build.package_windows(root, wheels)
+            with zipfile.ZipFile(download) as archive:
+                self.assertEqual(set(archive.namelist()), {"SIGMA-Setup.exe", "QUICKSTART.txt", "wheelhouse/torch.whl"})
+                self.assertEqual(archive.read("wheelhouse/torch.whl"), b"cuda")
+            self.assertIn(hashlib.sha256(download.read_bytes()).hexdigest(),
+                          download.with_suffix(".zip.sha256").read_text())
+
+    def test_external_payload_is_resolved_beside_installer_and_hash_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheels = root / "wheelhouse"
+            wheels.mkdir()
+            wheel = wheels / "torch.whl"
+            wheel.write_bytes(b"cuda")
+            bundle = {"wheelhouse_location": "next-to-installer", "wheels": [
+                {"filename": wheel.name, "sha256": hashlib.sha256(b"cuda").hexdigest()}]}
+            with patch.dict(os.environ, {"INSTALLER_PATH": str(root / "SIGMA-Setup.exe")}):
+                self.assertEqual(install.validated_wheelhouse(root / "runtime/sigma-desktop", bundle), wheels.resolve())
+                wheel.write_bytes(b"tampered")
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    install.validated_wheelhouse(root, bundle)
+                wheel.unlink()
+                with self.assertRaisesRegex(RuntimeError, "Extract All"):
+                    install.validated_wheelhouse(root, bundle)
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "Extract All"):
+                    install.validated_wheelhouse(root, bundle)
+
+    def test_payload_cannot_escape_wheelhouse(self):
+        for filename in ("../outside.whl", "..\\outside.whl", "/outside.whl"):
+            bundle = {"wheels": [{"filename": filename, "sha256": "0" * 64}]}
+            with self.assertRaisesRegex(ValueError, "Invalid wheel filename"):
+                install.validated_wheelhouse(ROOT, bundle)
 
     def test_user_pip_configuration_cannot_redirect_install(self):
         with patch.dict(os.environ, {"PIP_TARGET": "/outside", "PIP_PREFIX": "/outside", "PIP_CONFIG_FILE": "/user/pip.ini"}):
