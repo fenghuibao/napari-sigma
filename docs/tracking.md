@@ -1,12 +1,14 @@
-# Tracking
+# Tracking Analysis: 3D time series
 
-Tracking associates segmented objects between adjacent frames under a minimum-displacement assumption. It samples raw fluorescence within each object, matches those points across a frame pair, aggregates the correspondences into candidate object links, and classifies the retained link graph as linear, fission, fusion, or split-merge remodeling.
+[All examples](../README.md#examples)
+
+Tracking Analysis associates segmented objects between adjacent frames under a minimum-displacement assumption. It samples raw fluorescence within each object, matches those points across a frame pair, aggregates the correspondences into candidate object links, and classifies the retained link graph as linear, fission, fusion, or split-merge remodeling.
 
 ## Input requirements
 
 - **Raw image** must contain the intensity time series.
 - **Segmentation** must be spatially and temporally aligned with the raw image.
-- Expected axes are `TYX` for 2D or `TZYX` for 3D tracking.
+- Both inputs in this example use `TZYX` axes: time, Z, Y, and X.
 
 The raw image is required because point allocation and sampling use fluorescence intensity rather than segmentation geometry alone.
 
@@ -15,7 +17,7 @@ The raw image is required because point allocation and sampling use fluorescence
 - **Raw image:** [`tracking_example.tif`](../example/Tracking/tracking_example.tif)
 - **Segmentation:** [`tracking_example_segmentation.tif`](../example/Tracking/tracking_example_segmentation.tif)
 
-Open both TIFF files, then select them under **Raw image** and **Segmentation**, respectively. They contain aligned 2D time series for the complete matching, tracking, visualization, and refinement workflow below.
+Open both TIFF files, then select them under **Raw image** and **Segmentation**, respectively. They contain aligned 3D time series with **26 time points** and **39 Z slices per time point** (`TZYX`). Each frame is a 3D volume; tracking associates objects across adjacent time points, not between adjacent Z slices.
 
 ## 1. Match adjacent frames
 

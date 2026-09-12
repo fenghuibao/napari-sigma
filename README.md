@@ -12,12 +12,26 @@ Its four connected workflows quantify cellular morphology, dynamics, and spatial
 
 - **Segmentation**: image-specific GMM-MRF segmentation guided by tubular or sheet-like structural responses
 - **Morphology Analysis**: object geometry, skeleton branches, endpoints, junctions, and network topology
-- **Tracking**: adjacent-frame object matching, remodeling-event classification, visualization, and link refinement
+- **Tracking Analysis**: adjacent-frame object matching, remodeling-event classification, visualization, and link refinement
 - **Proximity Analysis**: image-resolution overlap, distance, Manders coefficients, and ROI-restricted spatial association
 
 SIGMA supports 2D, 3D, and time-series data and can run on CPU, CUDA, or Apple MPS when available.
 
 ## Installation
+
+### Desktop installers (no terminal required)
+
+Download a prebuilt SIGMA 0.0.6 application from [GitHub Releases](https://github.com/fenghuibao/napari-sigma/releases/tag/v0.0.6). These packages include Python and all required analysis libraries, so no conda, pip, or terminal setup is needed.
+
+| Platform | Download | Compute support |
+| --- | --- | --- |
+| Windows 10/11, Intel/AMD x64 | [Windows installer (.exe)](https://github.com/fenghuibao/napari-sigma/releases/download/v0.0.6/SIGMA-0.0.6-windows-x86_64-cu130.exe) | CUDA / CPU |
+| macOS 14 or later, Apple Silicon (M-series) | [Apple Silicon installer (.dmg.zip)](https://github.com/fenghuibao/napari-sigma/releases/download/v0.0.6/SIGMA-0.0.6-macos-arm64.dmg.zip) | MPS / CPU |
+| macOS 14 or later, Intel | [Intel Mac installer (.dmg.zip)](https://github.com/fenghuibao/napari-sigma/releases/download/v0.0.6/SIGMA-0.0.6-macos-x86_64.dmg.zip) | CPU |
+
+### Terminal installation (napari plugin)
+
+Use this method on Linux, for a custom Python environment, or to install SIGMA as a plugin in napari.
 
 Create a clean environment and install the published napari plugin:
 
@@ -39,7 +53,7 @@ napari-sigma
 
 PyQt5 does not normally need to be uninstalled: the launcher selects PyQt6 and its matching plugins before napari starts. It configures Qt only inside its own process and does not modify global environment variables. A fresh environment remains the safest recovery path for an environment with unrelated binary-level Qt conflicts. The standard `napari` command remains available when another backend is preferred.
 
-Starting with 0.0.4, SIGMA uses `opencv-python-headless`: image resizing and video export remain available, while napari supplies the GUI. Do not install multiple OpenCV variants together because they share the `cv2` namespace. When upgrading a dedicated SIGMA environment from an older release, remove the old OpenCV variants before reinstalling:
+SIGMA uses `opencv-python-headless`: image resizing and video export remain available, while napari supplies the GUI. Do not install multiple OpenCV variants together because they share the `cv2` namespace. When upgrading a dedicated SIGMA environment from an older release, remove the old OpenCV variants before reinstalling:
 
 ```bash
 python -m pip uninstall opencv-python opencv-contrib-python opencv-contrib-python-headless opencv-python-headless
@@ -70,65 +84,62 @@ napari-sigma
 
 ## Input data
 
-The napari reader currently supports:
+We recommend using TIFF files (`.tif`, `.tiff`) exported from Fiji/ImageJ.
 
-- TIFF: `.tif`, `.tiff`
+SIGMA also supports:
+
 - PNG: `.png`
 - JPEG: `.jpg`, `.jpeg`
-
-Microscope container formats such as CZI, ND2, LIF, and LSM should first be exported to one of the supported formats.
 
 SIGMA preserves available physical-size and axis metadata. If physical size metadata is unavailable, pixel or voxel size defaults to `1.0`.
 
 ## Quick start
 
-1. Start napari and open **Plugins > SIGMA**.
+### Basic steps
+
+1. **Desktop app users:** open **SIGMA**. **Plugin users:** start napari and open **Plugins > SIGMA**.
 2. In the **Segmentation** tab, select **Open File** and load a fluorescence image. TIFF is recommended when axis metadata or calibrated pixel and voxel sizes are needed.
 3. Confirm the interpreted channel, time, and slice ranges. Supported image organizations include `YX`, `ZYX`, `TYX`, and `TZYX`. Spatial 3D images open in napari's 3D display mode by default, while 2D time series remain in 2D.
 4. Review the physical scale under **Image Info** and correct it before any analysis that reports calibrated measurements.
-5. Select a computational device: **Auto** selects an available GPU when computation starts; **CPU**, **CUDA**, and **MPS** can also be requested explicitly. Unavailable devices fall back to CPU.
+5. Choose a computational device from the **Device** dropdown (**CPU**, **CUDA**, or **MPS**, depending on availability).
 6. Use **Segmentation** to extract local structural evidence and infer a binary foreground mask.
 7. Use **Morphology Analysis** to measure connected structures and their skeleton topology.
-8. For time series, use **Tracking** to associate objects across adjacent frames and classify linear, fission, fusion, or split-merge transitions.
+8. For time series, use **Tracking Analysis** to associate objects across adjacent frames and classify linear, fission, fusion, or split-merge transitions.
 9. For aligned fluorescence channels, use **Proximity Analysis** to quantify spatial association between independently segmented structures.
 
-Each workflow operates on napari layers. Check the selected layer before running a command, especially when raw, processed, structural-response, and segmentation layers are open together. Results are returned as regular napari layers regardless of the selected computational device.
-
-Starting SIGMA does not reload or replace existing layers. Use **Open File** to load a file through SIGMA, or select the SIGMA reader in napari's normal opening flow. Plotting libraries and charts load when the Morphology Analysis tab is first opened; the first plot may need to build a font cache. Proximity runs in a background worker; clicking the computation action again requests cancellation.
-
-### Development checks
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-GUI tests require a display (on headless Linux, use `xvfb-run -a`). Release builds are gated on regression tests on macOS/Linux and Python 3.11/3.13. See [CHANGELOG.md](./CHANGELOG.md) for changes that affect measurements and saved data.
-
-## Documentation
+### Examples
 
 - [Segmentation](./docs/segmentation.md)
+
+  - [2D mitochondria](./docs/segmentation-2d.md)
+  - [2D mitochondria (data from MoDL)](./docs/segmentation-2d-modl.md)
+  - [3D mitochondria](./docs/segmentation-3d-mitochondria.md)
+  - [3D ER](./docs/segmentation-3d-er.md)
+
 - [Morphology Analysis](./docs/morphology-analysis.md)
-- [Tracking](./docs/tracking.md)
+
+  - [2D mitochondria](./docs/morphology-2d.md)
+  - [3D mitochondria](./docs/morphology-3d-mitochondria.md)
+  - [3D ER](./docs/morphology-3d-er.md)
+
+- [Tracking Analysis](./docs/tracking.md)
+
+  - [3D mitochondria time series](./docs/tracking.md)
+
 - [Proximity Analysis](./docs/proximity-analysis.md)
+
+  - [3D mitochondria-ER](./docs/proximity-analysis.md)
 
 ## Example data
 
-The repository includes example fluorescence data for every documented workflow. Segmentation and morphology use the same raw images; tracking and proximity analysis also include aligned segmentation inputs so those workflows can be run directly.
+The repository includes example fluorescence data for every documented workflow. Segmentation and morphology use the same raw images; tracking analysis and proximity analysis also include aligned segmentation inputs so those workflows can be run directly.
 
-- **2D segmentation and morphology:** [`2d_example_raw.tif`](./example/2d/2d_example_raw.tif)
+- **2D segmentation and morphology:** [`2d_example.tif`](./example/2d/2d_example.tif)
+- **2D mitochondria (data from MoDL):** [`2d_example_MoDL.tif`](./example/2d/2d_example_MoDL.tif), originally `4.tif` from [MoDL](https://doi.org/10.1038/s41467-025-55825-x).
 - **3D mitochondrial segmentation and morphology:** [`3d_example_Mitochondria.tif`](./example/3d/3d_example_Mitochondria.tif)
 - **3D ER segmentation and morphology:** [`3d_example_ER.tif`](./example/3d/3d_example_ER.tif)
-- **Tracking:** [`tracking_example.tif`](./example/Tracking/tracking_example.tif) and [`tracking_example_segmentation.tif`](./example/Tracking/tracking_example_segmentation.tif)
+- **Tracking Analysis (3D time series):** [`tracking_example.tif`](./example/Tracking/tracking_example.tif) and [`tracking_example_segmentation.tif`](./example/Tracking/tracking_example_segmentation.tif)
 - **Mitochondria-ER proximity assay:** [`mitochondria raw`](./example/Proximity_analysis/proximity_assay_example_mito.tif), [`mitochondria segmentation`](./example/Proximity_analysis/proximity_assay_example_mito_segmentation.tif), [`ER raw`](./example/Proximity_analysis/proximity_assay_example_ER.tif), and [`ER segmentation`](./example/Proximity_analysis/proximity_assay_example_ER_segmentation.tif)
-
-Use TIFF for workflows that depend on axis metadata or physical pixel and voxel sizes. Files used together must have matching spatial dimensions, time axes, physical scales, and, for proximity analysis, spatial alignment.
-
-Follow the corresponding guides for the complete examples:
-
-- [Segmentation](./docs/segmentation.md): 2D mitochondria, 3D mitochondria, and 3D ER
-- [Morphology Analysis](./docs/morphology-analysis.md): object and skeleton analysis of the same three datasets
-- [Tracking](./docs/tracking.md): adjacent-frame matching, event classification, visualization, and refinement
-- [Proximity Analysis](./docs/proximity-analysis.md): full-volume and ROI-restricted mitochondria-ER analysis
 
 ## Segmentation
 
@@ -153,7 +164,7 @@ The Segmentation page contains five sections.
 
 ### Structural Awareness Extraction
 
-- Extract Hessian-derived vesselness, sheetness, or their voxelwise combined response.
+- Extract Hessian-derived vesselness (tubular), sheetness, or their voxelwise combined response.
 - Configure kernel radius, sigma range, PSF ratio, and response rescaling.
 - Run on the selected computational device.
 
@@ -174,9 +185,9 @@ Morphology Analysis labels connected objects and provides calibrated 2D or 3D me
 - branch-length distributions and topology summaries
 - object and branch table export
 
-## Tracking
+## Tracking Analysis
 
-Tracking operates on segmented time series under an adjacent-frame, minimum-displacement assumption and provides:
+Tracking Analysis operates on segmented time series under an adjacent-frame, minimum-displacement assumption and provides:
 
 - intensity-weighted point sampling and frame-to-frame matching
 - candidate-link costs based on distance, bidirectional coverage, and matched-point support
@@ -200,32 +211,6 @@ Proximity Analysis compares source and target structures segmented independently
 
 These measurements describe spatial association at the image resolution. They do not estimate physical membrane separation or, by themselves, establish molecular contact.
 
-## Build validation
-
-Build and validate the distribution locally:
-
-```bash
-python -m pip install --upgrade build twine
-python -m build
-python -m twine check dist/*
-```
-
-## Release process
-
-SIGMA is published as **`napari-sigma`**. The GitHub workflow uses PyPI Trusted Publishing; no long-lived PyPI API token is stored in the repository.
-
-1. Update `src/napari_sigma/_version.py`.
-2. Run the build validation commands above.
-3. Commit the release changes.
-4. Create and push a matching version tag, for example:
-
-```bash
-git tag v0.0.1
-git push origin v0.0.1
-```
-
-The tag triggers distribution validation and publishes the built package to PyPI. The PyPI Trusted Publisher must be configured for this repository, the `test_and_deploy.yml` workflow, and the `pypi` environment.
-
 ## Runtime dependencies
 
 Core runtime dependencies include napari, PyTorch, NumPy, SciPy, scikit-image, scikit-learn, OpenCV, tifffile, Pillow, matplotlib, dask, QtPy, and openpyxl. See [`pyproject.toml`](./pyproject.toml) for the authoritative version requirements.
@@ -233,13 +218,3 @@ Core runtime dependencies include napari, PyTorch, NumPy, SciPy, scikit-image, s
 ## License
 
 SIGMA is distributed under the [MIT License](./LICENSE).
-
-## Issues
-
-When reporting a problem, include:
-
-- operating system and hardware
-- Python, napari, Qt, and SIGMA versions
-- computational device (`cpu`, `cuda`, or `mps`)
-- input shape and axis interpretation
-- traceback or warning output

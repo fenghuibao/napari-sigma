@@ -1,4 +1,6 @@
-# Proximity Analysis
+# Proximity Analysis: 3D mitochondria-ER
+
+[All examples](../README.md#examples)
 
 Proximity Analysis quantifies spatial association between structures segmented independently in two aligned fluorescence channels. It combines mask overlap, directional intensity fractions, and nearest-target distances over the full image or within polygon regions of interest.
 
@@ -69,7 +71,9 @@ The Summary table includes available values such as:
 - proximity-restricted Manders coefficients
 - nearest-object and surface-proximity measurements
 
-**Manders M1** is the fraction of source-channel intensity inside the target mask. **Manders M2** is the reciprocal fraction of target-channel intensity inside the source mask. Geometric overlap is the fraction of the source mask intersecting the target mask. Directional mean and median distances are calculated from each source-mask or target-mask pixel/voxel to the nearest location in the other mask using calibrated spatial spacing when available.
+**Manders M1** is the source-channel intensity summed over the overlap of the two segmentation masks, divided by the source-channel intensity summed over the source mask. **Manders M2** uses target-channel intensity in the overlap divided by target-channel intensity within the target mask. For ROI analysis, all sums are restricted to the selected ROI.
+
+Geometric overlap is the fraction of the source mask intersecting the target mask. Directional mean and median distances are calculated from each source-mask or target-mask pixel/voxel to the nearest location in the other mask using calibrated spatial spacing when available.
 
 Selecting a Summary row filters the detailed proximity measurements to the corresponding ROI.
 
