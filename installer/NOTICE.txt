@@ -7,9 +7,11 @@ Source code: https://github.com/fenghuibao/napari-sigma
 This installer includes a private Python runtime and third-party open-source
 software, including napari, PyTorch, Qt/PyQt6, NumPy, SciPy and other libraries.
 Each dependency remains subject to its own license; upstream license and
-copyright files are retained in the installed packages (and wheel archives on
-Windows). Mac additionally includes Python's upstream licenses and PYTHON.json
-under SIGMA.app/Contents/Resources. No duplicate wheel archives are needed on Mac.
+copyright files are retained in the installed packages. Mac additionally includes
+Python's upstream licenses and PYTHON.json under SIGMA.app/Contents/Resources.
+Windows includes Python's LICENSE.txt and app-local, Microsoft-signed Visual C++
+runtime libraries from the official Microsoft.VC143.CRT redistribution directory.
+No duplicate wheel archives are needed in either installed application.
 See bundle.json and requirements.lock for the exact package versions and hashes.
 
 This test installer is not Developer ID notarized or Windows Authenticode signed.
@@ -19,5 +21,7 @@ organization blocks unsigned software, contact its IT administrator or wait
 for a signed distribution.
 
 No administrator Python, PATH, or shell configuration is changed. No user
-microscopy data is included. Installation uses only bundled wheels and does
-not require a network connection. No automatic updates are performed.
+microscopy data is included. All dependencies are preinstalled in the bundled
+private runtime. Setup does not use pip or require a network connection.
+No automatic updates are performed. No NVIDIA driver or CUDA Toolkit is installed
+system-wide; CUDA libraries remain inside SIGMA's private runtime.

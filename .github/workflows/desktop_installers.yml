@@ -70,7 +70,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.select-targets.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash -el {0}
@@ -88,8 +88,16 @@ jobs:
       - name: Packaging unit tests
         run: python -m unittest discover -s installer/tests -v
       - name: Build offline installer
-        if: needs.select-targets.outputs.windows-run == ''
+        if: needs.select-targets.outputs.windows-run == '' && runner.os != 'Windows'
         run: python installer/build.py --source-dir "$GITHUB_WORKSPACE" --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
+      - name: Retrieve hash-pinned Windows dependency cache
+        if: needs.select-targets.outputs.windows-run == '' && runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 34686779446 --repo "$GITHUB_REPOSITORY" --name SIGMA-0.0.6-win-64-unsigned --dir "$RUNNER_TEMP/sigma-dependency-cache"
+      - name: Build complete single-file Windows EXE
+        if: needs.select-targets.outputs.windows-run == '' && runner.os == 'Windows'
+        run: python installer/build_windows_exe.py --source-dir "$GITHUB_WORKSPACE" --dependency-package "$RUNNER_TEMP/sigma-dependency-cache/SIGMA-0.0.6-Windows-x64-CUDA-CPU-unsigned.zip" --work-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop
       - name: Retrieve existing Windows package for test-only changes
         if: needs.select-targets.outputs.windows-run != ''
         env:
@@ -125,7 +133,7 @@ jobs:
         if: runner.os == 'macOS'
         run: python installer/ci_macos_app.py --dmg dist-desktop/*.dmg --build-dir "$RUNNER_TEMP/sigma-build" --output-dir dist-desktop/verification --source-dir "$GITHUB_WORKSPACE"
       - name: Install Windows package (path with spaces)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.select-targets.outputs.windows-run != ''
         shell: pwsh
         run: |
           $download = (Get-ChildItem dist-desktop/*Windows*.zip).FullName
@@ -138,6 +146,10 @@ jobs:
           "SIGMA_TEST_PREFIX=$prefix" >> $env:GITHUB_ENV
           # The installed app must work after the download/payload is removed.
           Remove-Item -LiteralPath $extracted -Recurse -Force
+      - name: Install single Windows EXE, verify isolation and native icons
+        if: runner.os == 'Windows' && needs.select-targets.outputs.windows-run == ''
+        shell: pwsh
+        run: ./installer/ci_windows_exe.ps1 -Mode install
       - name: Prepare Windows runner OpenGL display
         if: runner.os == 'Windows'
         shell: pwsh
@@ -148,7 +160,7 @@ jobs:
         # The preceding step prepares only the disposable runner's display.
         run: python installer/verify.py --prefix "$SIGMA_TEST_PREFIX" --output-dir dist-desktop/verification --source-dir "$GITHUB_WORKSPACE"
       - name: Test Windows uninstaller
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs.select-targets.outputs.windows-run != ''
         shell: pwsh
         run: |
           $uninstaller = (Get-ChildItem "$env:SIGMA_TEST_PREFIX\Uninstall*.exe").FullName
@@ -159,6 +171,10 @@ jobs:
           foreach ($shortcut in $record.shortcuts.paths) {
             if (Test-Path $shortcut) { throw "Shortcut remains after uninstall: $shortcut" }
           }
+      - name: Verify native Windows uninstall and preserve user data
+        if: runner.os == 'Windows' && needs.select-targets.outputs.windows-run == ''
+        shell: pwsh
+        run: ./installer/ci_windows_exe.ps1 -Mode uninstall
       - name: Collect Windows installation diagnostics
         if: always() && runner.os == 'Windows'
         shell: pwsh
@@ -177,6 +193,8 @@ jobs:
             dist-desktop/verification/
             dist-desktop/source-provenance.json
             dist-desktop/bundle-win-64.json
+            dist-desktop/package-size.json
+            dist-desktop/*.exe.sha256
           retention-days: 30
       - uses: actions/upload-artifact@v4
         if: always()

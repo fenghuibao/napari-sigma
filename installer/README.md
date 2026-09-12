@@ -226,3 +226,23 @@ Verify the resulting DMG using `ci_macos_app.py --dmg PATH --build-dir WORK
 from a read-only image, relocates a test-owned copy, tests the installed core,
 and removes only that temporary copy. Existing SIGMA installations and user
 preferences are preserved. Verification uses disposable home directories.
+# Single-file Windows installer
+
+The maintained Windows entry point is now `build_windows_exe.py`. It builds the
+current core checkout, reuses the SHA-256-pinned CUDA dependency ZIP only as a
+build cache, installs those locked wheels into a portable CPython runtime, and
+compresses the expanded runtime with Inno Setup 7.1.0 (solid LZMA2). The delivered
+`SIGMA-0.0.6-windows-x86_64-cu130.exe` requires no sidecar files or downloads.
+Python, CPU/CUDA dependencies, Microsoft app-local CRT, licenses, chart font
+index and the multi-resolution SIGMA icon are all included. NVIDIA drivers remain
+the user's system prerequisite and are never modified by the installer.
+
+The native CI verifies installation from a folder containing only the EXE, every
+payload file's hash, PE Setup/Uninstall icons, shortcut targets/icons, nonempty
+folder protection, launch and core/GUI/font regressions after deleting the build
+runtime and wheel cache, and uninstall without removing user-created files.
+`package-size.json` reports whether the EXE fits GitHub's individual asset limit;
+never split or switch to CPU-only automatically if it does not.
+
+Legacy constructor/ZIP functions remain available only to reproduce old builds
+and their regression tests. They are not used for the new Windows release.

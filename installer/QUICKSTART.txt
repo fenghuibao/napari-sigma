@@ -13,11 +13,11 @@ INSTALL AND OPEN
 1. Mac: open the DMG and drag SIGMA.app to Applications, then eject the DMG.
    Python and all analysis dependencies are inside SIGMA.app, not /Library.
    You may also copy the complete app to your personal Applications folder.
-   Windows: right-click the ZIP > Extract All. Open the extracted folder and
-   double-click SIGMA-Setup.exe, leaving its wheelhouse folder beside it.
-   Do not launch the EXE from inside the ZIP. After installation, you can delete
-   the ZIP and extracted installer folder; SIGMA has its own complete runtime.
-2. Windows runtime installation may take several minutes. Mac needs only copying.
+   Windows: double-click SIGMA-0.0.6-windows-x86_64-cu130.exe and follow Setup.
+   This one EXE contains Python, CUDA/CPU and every analysis dependency.
+   No ZIP extraction, extra downloads or separate wheelhouse folder is needed.
+   After installation, you may delete the EXE; SIGMA has its own complete runtime.
+2. Windows installation may take several minutes. Mac needs only copying.
 3. Open "SIGMA" from Applications (Mac) or Start/Desktop (Windows).
 4. The SIGMA panel opens automatically. Use Open File or drag a TIFF into napari.
 5. Check channel, time, Z and physical pixel sizes before analysis.
